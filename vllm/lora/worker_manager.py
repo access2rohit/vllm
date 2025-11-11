@@ -55,6 +55,12 @@ class WorkerLoRAManager:
         self.device = device
         # Lazily initialized by create_lora_manager.
         self._adapter_manager: LoRAModelManager
+        
+        # Request-level pipelining manager
+        # Set DISABLE_LORA_PREFETCH=1 to disable optimization for baseline testing
+        import os
+        self.prefetch_enabled = os.getenv('DISABLE_LORA_PREFETCH', '0') != '1'
+        self.pipeline_mgr = RequestPipelineManager(device=device) if self.prefetch_enabled else None
 
     @contextmanager
     def dummy_lora_cache(self):
@@ -256,19 +262,29 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         # the single-threaded core engine loop.
 
         if lora_request.lora_int_id not in self.list_adapters():
-            # Load the new adapter first to ensure it is actually valid, before
-            # evicting any existing adapters.
-            # This may cause the # of loaded lora adapters to very temporarily
-            # exceed `--max-cpu-loras`.
-            lora = self._load_adapter(lora_request)
+            # Check if this LoRA was prefetched (only if prefetch is enabled)
+            prefetch_hit = (self.prefetch_enabled and 
+                          self.pipeline_mgr and 
+                          self.pipeline_mgr.wait_for_prefetch(lora_request.lora_int_id))
+            
+            if not prefetch_hit:
+                # Load the new adapter first to ensure it is actually valid, before
+                # evicting any existing adapters.
+                # This may cause the # of loaded lora adapters to very temporarily
+                # exceed `--max-cpu-loras`.
+                lora = self._load_adapter(lora_request)
 
-            # Loading succeeded, now check if we will exceed cache capacity and
-            # evict if the oldest adapter if so
-            if len(self._adapter_manager) + 1 > self._adapter_manager.capacity:
-                assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
-                self._adapter_manager.remove_oldest_adapter()
-            # Then add the new adapter to the cache
-            loaded = self._adapter_manager.add_adapter(lora)
+                # Loading succeeded, now check if we will exceed cache capacity and
+                # evict if the oldest adapter if so
+                if len(self._adapter_manager) + 1 > self._adapter_manager.capacity:
+                    assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
+                    self._adapter_manager.remove_oldest_adapter()
+                # Then add the new adapter to the cache
+                loaded = self._adapter_manager.add_adapter(lora)
+            else:
+                # LoRA was prefetched, just mark as loaded
+                loaded = True
+                logger.debug(f"LoRA {lora_request.lora_int_id} loaded from prefetch cache")
         else:
             # If the lora is already loaded, just touch it to
             # update its position in the caches
@@ -277,3 +293,69 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             )
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
         return loaded
+    
+    def prefetch_next_adapter(self, next_lora_request: LoRARequest) -> None:
+        """Start prefetching the next LoRA adapter in the background.
+        
+        This method should be called when processing the current request
+        to start loading the next LoRA adapter in parallel.
+        """
+        if (self.prefetch_enabled and self.pipeline_mgr and 
+            next_lora_request and next_lora_request.lora_int_id not in self.list_adapters()):
+            self.pipeline_mgr.start_prefetch(next_lora_request, self)
+
+
+class RequestPipelineManager:
+    """Manages request-level pipelining for LoRA loading optimization.
+    
+    This class implements request-level pipelining where the next LoRA adapter
+    is loaded in the background while the current request is being processed,
+    significantly reducing perceived latency for multi-request scenarios.
+    """
+    
+    def __init__(self, device="cuda"):
+        self.device = device
+        self.transfer_stream = torch.cuda.Stream(device=device)
+        self.compute_stream = torch.cuda.current_stream(device)
+        self.prefetch_cache = {}
+        self.current_prefetch_id = None
+        self.prefetch_in_progress = False
+        
+    def start_prefetch(self, lora_request: LoRARequest, worker_manager: "LRUCacheWorkerLoRAManager") -> None:
+        """Start prefetching a LoRA adapter in the background."""
+        if self.prefetch_in_progress or lora_request.lora_int_id in worker_manager.list_adapters():
+            return
+            
+        self.current_prefetch_id = lora_request.lora_int_id
+        self.prefetch_in_progress = True
+        
+        # Start async loading on transfer stream
+        with torch.cuda.stream(self.transfer_stream):
+            try:
+                # Load adapter to CPU first
+                lora = worker_manager._load_adapter(lora_request)
+                self.prefetch_cache[lora_request.lora_int_id] = lora
+                
+                # Add to manager's CPU cache
+                if len(worker_manager._adapter_manager) + 1 > worker_manager._adapter_manager.capacity:
+                    worker_manager._adapter_manager.remove_oldest_adapter()
+                worker_manager._adapter_manager.add_adapter(lora)
+                
+            except Exception as e:
+                logger.warning(f"Prefetch failed for LoRA {lora_request.lora_int_id}: {e}")
+            finally:
+                self.prefetch_in_progress = False
+    
+    def wait_for_prefetch(self, lora_id: int) -> bool:
+        """Wait for prefetch to complete if it's for the requested LoRA."""
+        if self.current_prefetch_id == lora_id and self.prefetch_in_progress:
+            self.transfer_stream.synchronize()
+            self.prefetch_in_progress = False
+            return True
+        return False
+    
+    def clear_prefetch(self):
+        """Clear prefetch state."""
+        self.current_prefetch_id = None
+        self.prefetch_in_progress = False
+        self.prefetch_cache.clear()
