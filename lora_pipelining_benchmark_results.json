@@ -1,0 +1,128 @@
+{
+  "benchmark_info": {
+    "model": "openai/gpt-oss-20b",
+    "lora_path": "/fsx/srivrohi/hf_cache/tat-qa/gpt-oss-20b/moe-all-eager-0-rank-128/lora_adapter",
+    "timestamp": "2025-11-05 21:15:29",
+    "gpu_info": {
+      "device_count": 8,
+      "device_name": "NVIDIA H200"
+    }
+  },
+  "results": [
+    {
+      "scenario": "Single Request",
+      "baseline_time": 0.4246559143066406,
+      "optimized_time": 0.434694766998291,
+      "improvement_pct": -2.3639969098373173,
+      "throughput_baseline": 2.3548476927084736,
+      "throughput_optimized": 2.300464776480577,
+      "throughput_improvement": 0.9769059729865811,
+      "details": {
+        "baseline": {
+          "total_time": 0.4246559143066406,
+          "avg_request_time": 0.4246408939361572,
+          "request_times": [
+            0.4246408939361572
+          ],
+          "throughput": 2.3548476927084736,
+          "first_request_time": 0.4246408939361572,
+          "subsequent_avg": 0
+        },
+        "optimized": {
+          "total_time": 0.434694766998291,
+          "avg_request_time": 0.4346742630004883,
+          "request_times": [
+            0.4346742630004883
+          ],
+          "throughput": 2.300464776480577,
+          "first_request_time": 0.4346742630004883,
+          "subsequent_avg": 0
+        }
+      }
+    },
+    {
+      "scenario": "Multi-Request (5)",
+      "baseline_time": 5.638389348983765,
+      "optimized_time": 6.5797693729400635,
+      "improvement_pct": -16.69590313279746,
+      "throughput_baseline": 0.8867780656015135,
+      "throughput_optimized": 0.7599050539009745,
+      "throughput_improvement": 0.8569281124308377,
+      "details": {
+        "baseline": {
+          "total_time": 5.638389348983765,
+          "avg_request_time": 1.12766432762146,
+          "request_times": [
+            0.42963075637817383,
+            2.413719654083252,
+            0.9328358173370361,
+            0.9273607730865479,
+            0.93477463722229
+          ],
+          "throughput": 0.8867780656015135,
+          "first_request_time": 0.42963075637817383,
+          "subsequent_avg": 1.3021727204322815
+        },
+        "optimized": {
+          "total_time": 6.5797693729400635,
+          "avg_request_time": 1.3159409523010255,
+          "request_times": [
+            0.4315338134765625,
+            2.2426719665527344,
+            2.4232325553894043,
+            0.691662073135376,
+            0.7906043529510498
+          ],
+          "throughput": 0.7599050539009745,
+          "first_request_time": 0.4315338134765625,
+          "subsequent_avg": 1.5370427370071411
+        }
+      }
+    },
+    {
+      "scenario": "Stress Test (10)",
+      "baseline_time": 8.362836599349976,
+      "optimized_time": 8.697960138320923,
+      "improvement_pct": -4.007295072547461,
+      "throughput_baseline": 1.195766517879505,
+      "throughput_optimized": 1.1496948526980058,
+      "throughput_improvement": 0.961471019222716,
+      "details": {
+        "baseline": {
+          "total_time": 8.362836599349976,
+          "avg_request_time": 1.045341044664383,
+          "request_times": [
+            0.42558979988098145,
+            2.4017679691314697,
+            0.9309511184692383,
+            0.9265787601470947,
+            0.9206447601318359,
+            0.9190266132354736,
+            0.9193019866943359,
+            0.9188673496246338
+          ],
+          "throughput": 1.195766517879505,
+          "first_request_time": 0.42558979988098145,
+          "subsequent_avg": 1.1338769367762975
+        },
+        "optimized": {
+          "total_time": 8.697960138320923,
+          "avg_request_time": 1.0872333943843842,
+          "request_times": [
+            0.4305288791656494,
+            2.3066537380218506,
+            2.4166157245635986,
+            0.6604783535003662,
+            0.7719430923461914,
+            0.6635644435882568,
+            0.7807197570800781,
+            0.667363166809082
+          ],
+          "throughput": 1.1496948526980058,
+          "first_request_time": 0.4305288791656494,
+          "subsequent_avg": 1.1810483251299178
+        }
+      }
+    }
+  ]
+}

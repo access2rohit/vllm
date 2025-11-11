@@ -1,0 +1,88 @@
+{
+  "baseline": {
+    "total_requests": 3,
+    "request_profiles": [
+      {
+        "request_id": 1,
+        "lora_id": 1,
+        "time": 0.1673576831817627,
+        "output": " They are amphibians. They are"
+      },
+      {
+        "request_id": 2,
+        "lora_id": 2,
+        "time": 2.342151641845703,
+        "output": "\n\nPhotosynthesis is a process "
+      },
+      {
+        "request_id": 3,
+        "lora_id": 3,
+        "time": 0.8175308704376221,
+        "output": "**  \n   Machine learning is a "
+      }
+    ],
+    "total_time": 3.327040195465088,
+    "avg_time": 1.1090133984883626
+  },
+  "pipelined": {
+    "total_requests": 3,
+    "request_profiles": [
+      {
+        "request_id": 1,
+        "lora_id": 1,
+        "time": 0.17654943466186523,
+        "output": " They are amphibians. They hav"
+      },
+      {
+        "request_id": 2,
+        "lora_id": 2,
+        "time": 2.1703543663024902,
+        "output": "\n\nPhotosynthesis is a process "
+      },
+      {
+        "request_id": 3,
+        "lora_id": 3,
+        "time": 2.244178056716919,
+        "output": "**  \n   Machine learning is a "
+      }
+    ],
+    "total_time": 4.591081857681274,
+    "avg_time": 1.5303606192270915
+  },
+  "memory": {
+    "stages": [
+      {
+        "stage": "initial",
+        "allocated": 0.0,
+        "reserved": 0.0,
+        "max_allocated": 0.0
+      },
+      {
+        "stage": "model_loaded",
+        "allocated": 0.0,
+        "reserved": 0.0,
+        "max_allocated": 0.0
+      },
+      {
+        "stage": "first_lora",
+        "allocated": 0.0,
+        "reserved": 0.0,
+        "max_allocated": 0.0
+      },
+      {
+        "stage": "second_lora",
+        "allocated": 0.0,
+        "reserved": 0.0,
+        "max_allocated": 0.0
+      }
+    ]
+  },
+  "summary": {
+    "baseline_avg_time": 1.1090133984883626,
+    "pipelined_avg_time": 1.5303606192270915,
+    "improvement_pct": -37.992978381780155,
+    "baseline_total": 3.327040195465088,
+    "pipelined_total": 4.591081857681274,
+    "total_improvement_pct": -37.99297838178014
+  }
+}
