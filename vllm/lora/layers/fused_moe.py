@@ -24,7 +24,7 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import modular_marlin
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_lora_align_block_size)
 
-from vllm.vllm.lora.ops.triton_ops.utils_new import get_v1_op_configs
+from vllm.lora.ops.triton_ops.utils import get_v1_op_configs
 
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
