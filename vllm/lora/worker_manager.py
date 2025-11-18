@@ -301,7 +301,8 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         to start loading the next LoRA adapter in parallel.
         """
         if (self.prefetch_enabled and self.pipeline_mgr and 
-            next_lora_request and next_lora_request.lora_int_id not in self.list_adapters()):
+            next_lora_request):
+            # next_lora_request and next_lora_request.lora_int_id not in self.list_adapters()):
             self.pipeline_mgr.start_prefetch(next_lora_request, self)
 
 
@@ -323,7 +324,8 @@ class RequestPipelineManager:
         
     def start_prefetch(self, lora_request: LoRARequest, worker_manager: "LRUCacheWorkerLoRAManager") -> None:
         """Start prefetching a LoRA adapter in the background."""
-        if self.prefetch_in_progress or lora_request.lora_int_id in worker_manager.list_adapters():
+        # if self.prefetch_in_progress or lora_request.lora_int_id in worker_manager.list_adapters():
+        if self.prefetch_in_progress:
             return
             
         self.current_prefetch_id = lora_request.lora_int_id
@@ -340,6 +342,7 @@ class RequestPipelineManager:
                 if len(worker_manager._adapter_manager) + 1 > worker_manager._adapter_manager.capacity:
                     worker_manager._adapter_manager.remove_oldest_adapter()
                 worker_manager._adapter_manager.add_adapter(lora)
+                worker_manager._adapter_manager.activate_adapter(lora_request.lora_int_id)
                 
             except Exception as e:
                 logger.warning(f"Prefetch failed for LoRA {lora_request.lora_int_id}: {e}")

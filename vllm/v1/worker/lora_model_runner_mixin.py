@@ -129,13 +129,13 @@ class LoRAModelRunnerMixin:
                 # In a batched scenario, this LoRA will be needed soon
                 # and the prefetch can complete while we process other requests
                 lora_req = unloaded_loras[0]
-                logger.info(
-                    f"🚀 Batch prefetch: Triggering for LoRA {lora_req.lora_int_id} "
-                    f"({len(unloaded_loras)} unloaded in batch, {len(lora_requests)} total)"
-                )
+                # logger.info(
+                #     f"🚀 Batch prefetch: Triggering for LoRA {lora_req.lora_int_id} "
+                #     f"({len(unloaded_loras)} unloaded in batch, {len(lora_requests)} total)"
+                # )
                 self.lora_manager.prefetch_next_adapter(lora_req)
-            else:
-                logger.debug(f"✅ All {len(lora_requests)} LoRAs in batch already loaded")
+            # else:
+            #     logger.debug(f"✅ All {len(lora_requests)} LoRAs in batch already loaded")
                     
         except Exception as e:
             # Don't let prefetch errors break the main execution
