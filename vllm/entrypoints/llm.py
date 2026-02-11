@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from typing_extensions import TypeVar
 
 from vllm.beam_search import (
+    BeamSearchConfig,
     BeamSearchInstance,
     BeamSearchOutput,
     BeamSearchSequence,
@@ -613,30 +614,125 @@ class LLM:
         """
         Generate sequences using beam search.
 
-        Args:
-            prompts: A list of prompts. Each prompt can be a string or a list
-                of token IDs.
-            params: The beam search parameters.
-            lora_request: LoRA request to use for generation, if any.
-            use_tqdm: Whether to use tqdm to display the progress bar.
-            concurrency_limit: The maximum number of concurrent requests.
-                If None, the number of concurrent requests is unlimited.
+        Uses GPU-resident beam search when possible (no LoRA, no multimodal,
+        single prompt). Falls back to the original CPU-loop approach otherwise.
         """
-        # TODO: how does beam search work together with length penalty,
-        # frequency, penalty, and stopping criteria, etc.?
+        tokenizer = self.get_tokenizer()
+        sort_beams_key = create_sort_beams_key_function(
+            tokenizer.eos_token_id,
+            params.length_penalty,
+        )
+
+        # Check if we can use the GPU-resident fast path
+        has_lora = lora_request is not None
+        has_multimodal = any("multi_modal_data" in p for p in prompts)
+
+        if not has_lora and not has_multimodal:
+            # GPU-resident beam search (Tier 3)
+            return self._beam_search_gpu_resident(
+                prompts,
+                params,
+                tokenizer,
+                sort_beams_key,
+            )
+
+        # Fallback: original CPU-loop beam search
+        return self._beam_search_cpu_loop(
+            prompts,
+            params,
+            lora_request,
+            use_tqdm,
+            concurrency_limit,
+            tokenizer,
+            sort_beams_key,
+        )
+
+    def _beam_search_gpu_resident(
+        self,
+        prompts: list[TokensPrompt | TextPrompt],
+        params: BeamSearchParams,
+        tokenizer,
+        sort_beams_key,
+    ) -> list[BeamSearchOutput]:
+        """GPU-resident beam search. Runs the entire beam search loop
+        inside the worker, minimizing GPU<->CPU transfers."""
+        from math import ceil
+
+        beam_width = params.beam_width
+        max_tokens = params.max_tokens
+        block_size = self.llm_engine.cache_config.block_size
+
+        outputs = []
+        for prompt in prompts:
+            if "prompt_token_ids" in prompt:
+                prompt = cast(TokensPrompt, prompt)
+                prompt_tokens = prompt["prompt_token_ids"]
+            else:
+                prompt_tokens = tokenizer.encode(prompt["prompt"])
+
+            prompt_len = len(prompt_tokens)
+
+            # Calculate blocks needed
+            num_prompt_blocks = ceil(prompt_len / block_size)
+            max_gen_blocks = ceil(max_tokens / block_size)
+            # prompt blocks (shared) + beam_width * gen blocks + spare
+            total_blocks = (
+                num_prompt_blocks
+                + beam_width * max_gen_blocks
+                + beam_width  # spare for copy-on-write
+            )
+
+            # Allocate blocks from the scheduler
+            block_ids = self.llm_engine.allocate_beam_search_blocks(
+                total_blocks,
+            )
+
+            config = BeamSearchConfig(
+                beam_width=beam_width,
+                max_tokens=max_tokens,
+                eos_token_id=tokenizer.eos_token_id,
+                length_penalty=params.length_penalty,
+                ignore_eos=params.ignore_eos,
+                temperature=params.temperature,
+                prompt_token_ids=prompt_tokens,
+            )
+
+            try:
+                result = self.llm_engine.execute_beam_search(
+                    config,
+                    block_ids,
+                    block_size,
+                )
+
+                # Decode text for the output beams
+                for beam in result.sequences:
+                    beam.text = tokenizer.decode(beam.tokens)
+
+                outputs.append(result)
+            finally:
+                # Free blocks back to the pool
+                self.llm_engine.free_beam_search_blocks(block_ids)
+
+        return outputs
+
+    def _beam_search_cpu_loop(
+        self,
+        prompts: list[TokensPrompt | TextPrompt],
+        params: BeamSearchParams,
+        lora_request: list[LoRARequest] | LoRARequest | None,
+        use_tqdm: bool,
+        concurrency_limit: int | None,
+        tokenizer,
+        sort_beams_key,
+    ) -> list[BeamSearchOutput]:
+        """Original CPU-loop beam search. Used as fallback for LoRA
+        and multimodal prompts."""
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         temperature = params.temperature
         ignore_eos = params.ignore_eos
-        length_penalty = params.length_penalty
 
         lora_requests = self._get_beam_search_lora_requests(lora_request, prompts)
-
-        tokenizer = self.get_tokenizer()
-        sort_beams_key = create_sort_beams_key_function(
-            tokenizer.eos_token_id,
-            length_penalty,
-        )
 
         if use_tqdm and concurrency_limit is not None:
             logger.warning(
@@ -652,24 +748,19 @@ class LLM:
             token_prompt_kwargs: TokensPrompt = {"prompt_token_ids": beam.tokens}
             if beam.multi_modal_data is not None:
                 token_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
-
             if beam.mm_processor_kwargs is not None:
                 token_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
             return TokensPrompt(**token_prompt_kwargs)
 
-        # generate 2 * beam_width candidates at each step
-        # following the huggingface transformers implementation
-        # at https://github.com/huggingface/transformers/blob/e15687fffe5c9d20598a19aeab721ae0a7580f8a/src/transformers/generation/beam_search.py#L534 # noqa
         beam_search_params = SamplingParams(
             logprobs=2 * beam_width,
             max_tokens=1,
             temperature=temperature,
-            skip_clone=True,  # Internal beam search, safe to skip clone
+            skip_clone=True,
         )
         instances: list[BeamSearchInstance] = []
 
         for lora_req, prompt in zip(lora_requests, prompts):
-            # Add multimodal processor kwargs & data
             mm_kwargs = {}
             if "multi_modal_data" in prompt:
                 mm_kwargs["multi_modal_data"] = prompt["multi_modal_data"]
@@ -677,7 +768,7 @@ class LLM:
                 mm_kwargs["mm_processor_kwargs"] = prompt["mm_processor_kwargs"]
 
             if "prompt_token_ids" in prompt:
-                prompt = cast(TokensPrompt, prompt)  # Needed for mypy
+                prompt = cast(TokensPrompt, prompt)
                 prompt_tokens = prompt["prompt_token_ids"]
             else:
                 prompt_tokens = tokenizer.encode(prompt["prompt"])
@@ -720,7 +811,6 @@ class LLM:
                 if len(all_beams) == 0:
                     break
 
-                # create corresponding batch entries for prompt & optional lora
                 prompts_batch, lora_req_batch = zip(
                     *[
                         (create_tokens_prompt_from_beam(beam), beam.lora_request)
@@ -728,8 +818,6 @@ class LLM:
                     ]
                 )
 
-                # only runs for one step
-                # we don't need to use tqdm here
                 output = self.generate(
                     prompts_batch,
                     sampling_params=beam_search_params,
@@ -746,10 +834,6 @@ class LLM:
                         result = output[i]
 
                         if result.outputs[0].logprobs is not None:
-                            # if `result.outputs[0].logprobs` is None, it means
-                            # the sequence is completed because of the
-                            # max-model-len or abortion. we don't need to add
-                            # it to the new beams.
                             logprobs = result.outputs[0].logprobs[0]
                             for token_id, logprob_obj in logprobs.items():
                                 new_beam = BeamSearchSequence(

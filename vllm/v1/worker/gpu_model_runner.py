@@ -21,6 +21,14 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.beam_search import (
+    BeamSearchConfig,
+    BeamSearchOutput,
+    BeamSearchSequence,
+    BeamSearchState,
+    create_sort_beams_key_function,
+    gpu_beam_select,
+)
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -5744,6 +5752,387 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
             )
+
+    # ================================================================
+    # Tier 3: GPU-Resident Beam Search
+    # ================================================================
+
+    @torch.inference_mode()
+    def execute_beam_search(
+        self,
+        config: BeamSearchConfig,
+        block_ids: list[int],
+        block_size: int,
+    ) -> BeamSearchOutput:
+        """Run the entire beam search loop inside the worker.
+
+        The model forward, beam selection, KV cache reindexing, and
+        next-token feeding all happen on GPU. Only the final result
+        crosses GPU→CPU.
+
+        Args:
+            config: Immutable beam search configuration.
+            block_ids: Pre-allocated block IDs from the scheduler.
+                       Enough for beam_width * max_gen_blocks + spare.
+            block_size: KV cache block size.
+        """
+        from collections import deque
+
+        from vllm import _custom_ops as ops
+
+        device = self.device
+        beam_width = config.beam_width
+        max_tokens = config.max_tokens
+        prompt_token_ids = config.prompt_token_ids
+        prompt_len = len(prompt_token_ids)
+        eos_token_id = config.eos_token_id
+        ignore_eos = config.ignore_eos
+        length_penalty = config.length_penalty
+
+        # --- Validate assumptions ---
+        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+            "GPU beam search currently supports single KV cache group only"
+        )
+        kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
+
+        # --- Block management ---
+        spare_blocks = deque(block_ids)
+        max_gen_blocks = cdiv(max_tokens, block_size)
+        total_seq_blocks = cdiv(prompt_len, block_size) + max_gen_blocks
+        num_prompt_blocks = cdiv(prompt_len, block_size)
+
+        # --- Initialize beam state ---
+        state = BeamSearchState.initialize(
+            prompt_token_ids, beam_width, max_tokens, device
+        )
+
+        # --- Set up block table for beam search ---
+        # We use a standalone numpy + GPU block table, NOT self.input_batch
+        beam_bt_np = np.zeros((beam_width, total_seq_blocks), dtype=np.int32)
+        beam_bt_gpu = torch.zeros(
+            beam_width,
+            total_seq_blocks,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Allocate prompt blocks (shared across all beams)
+        prompt_block_ids = [spare_blocks.popleft() for _ in range(num_prompt_blocks)]
+        for b in range(beam_width):
+            beam_bt_np[b, :num_prompt_blocks] = prompt_block_ids
+
+        # Allocate first generation block for beam 0 only
+        # (we start with 1 active beam; expand after first step)
+        first_gen_block = spare_blocks.popleft()
+        beam_bt_np[0, num_prompt_blocks] = first_gen_block
+
+        beam_bt_gpu[:] = torch.from_numpy(beam_bt_np).to(device)
+
+        # --- Prefill: run the prompt through the model ---
+        # Build input tensors for the full prompt
+        input_ids_prefill = torch.tensor(
+            prompt_token_ids, dtype=torch.long, device=device
+        )
+        positions_prefill = torch.arange(prompt_len, dtype=torch.long, device=device)
+
+        # Slot mapping for prefill: each token maps to its block+offset
+        prefill_block_indices = positions_prefill // block_size
+        prefill_block_offsets = positions_prefill % block_size
+        prefill_block_ids_tensor = beam_bt_gpu[0][prefill_block_indices.long()]
+        prefill_slot_mapping = (
+            prefill_block_ids_tensor.long() * block_size + prefill_block_offsets
+        )
+
+        # Attention metadata for prefill (single sequence)
+        prefill_seq_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
+        prefill_query_start_loc = torch.tensor(
+            [0, prompt_len], dtype=torch.int64, device=device
+        )
+
+        prefill_cm = CommonAttentionMetadata(
+            query_start_loc=prefill_query_start_loc,
+            query_start_loc_cpu=prefill_query_start_loc.cpu(),
+            seq_lens=prefill_seq_lens,
+            _seq_lens_cpu=prefill_seq_lens.cpu(),
+            _num_computed_tokens_cpu=torch.tensor([0], dtype=torch.int32),
+            num_reqs=1,
+            num_actual_tokens=prompt_len,
+            max_query_len=prompt_len,
+            max_seq_len=prompt_len,
+            block_table_tensor=beam_bt_gpu[:1],
+            slot_mapping=prefill_slot_mapping,
+            causal=True,
+        )
+
+        # Build per-layer attention metadata
+        prefill_attn_metadata = {}
+        for attn_group in self.attn_groups[0]:
+            builder = attn_group.get_metadata_builder(0)
+            layer_meta = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=prefill_cm,
+            )
+            for layer_name in attn_group.layer_names:
+                prefill_attn_metadata[layer_name] = layer_meta
+
+        # Build slot_mapping dict keyed by layer name
+        prefill_slot_by_layer = {
+            ln: prefill_slot_mapping for ln in kv_cache_group.layer_names
+        }
+
+        # Run prefill forward pass
+        with set_forward_context(
+            prefill_attn_metadata,
+            self.vllm_config,
+            num_tokens=prompt_len,
+            slot_mapping=prefill_slot_by_layer,
+        ):
+            hidden_states = self._model_forward(
+                input_ids=input_ids_prefill,
+                positions=positions_prefill,
+            )
+
+        # Extract logits from last token only
+        if hidden_states.dim() == 2:
+            last_hidden = hidden_states[-1:, :]
+        else:
+            last_hidden = hidden_states[-1:]
+        logits = self.model.compute_logits(last_hidden)  # [1, vocab]
+
+        # --- Block 2: Initialize beams from prefill logits ---
+        logprobs = torch.log_softmax(logits.float(), dim=-1)  # [1, V]
+        topk_logprobs, topk_indices = torch.topk(
+            logprobs[0], beam_width
+        )  # [beam_width]
+
+        # Write first generated tokens
+        state.token_ids[:beam_width, prompt_len] = topk_indices
+        state.cum_logprobs[:beam_width] = topk_logprobs
+        state.num_active = beam_width
+
+        # --- Block 3: Expand block table for all beams ---
+        # Allocate generation blocks for beams 1..beam_width-1
+        for b in range(1, beam_width):
+            gen_block = spare_blocks.popleft()
+            beam_bt_np[b, :num_prompt_blocks] = prompt_block_ids
+            beam_bt_np[b, num_prompt_blocks] = gen_block
+
+        # Beam 0 already has its gen block from above
+        beam_bt_gpu[:] = torch.from_numpy(beam_bt_np).to(device)
+
+        # --- Block 4-5: Main decode loop ---
+        num_active = beam_width
+
+        for step in range(max_tokens):
+            if num_active == 0:
+                break
+
+            token_col = prompt_len + step
+            seq_len_after = token_col + 1
+
+            # 4a. Build input tensors
+            input_ids = state.token_ids[:num_active, token_col].contiguous()
+            positions = torch.full(
+                (num_active,), token_col, dtype=torch.long, device=device
+            )
+
+            # 4b. Compute slot mapping
+            block_idx = token_col // block_size
+            block_offset = token_col % block_size
+            block_ids_t = beam_bt_gpu[:num_active, block_idx]
+            slot_mapping = block_ids_t.long() * block_size + block_offset
+
+            # 4c. Build attention metadata
+            attn_seq_lens = torch.full(
+                (num_active,),
+                seq_len_after,
+                dtype=torch.int32,
+                device=device,
+            )
+            query_start_loc = torch.arange(
+                num_active + 1,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            decode_cm = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc.cpu(),
+                seq_lens=attn_seq_lens,
+                _seq_lens_cpu=attn_seq_lens.cpu(),
+                _num_computed_tokens_cpu=torch.full(
+                    (num_active,),
+                    token_col,
+                    dtype=torch.int32,
+                ),
+                num_reqs=num_active,
+                num_actual_tokens=num_active,
+                max_query_len=1,
+                max_seq_len=seq_len_after,
+                block_table_tensor=beam_bt_gpu[:num_active],
+                slot_mapping=slot_mapping,
+                causal=True,
+            )
+
+            decode_attn_metadata = {}
+            for attn_group in self.attn_groups[0]:
+                builder = attn_group.get_metadata_builder(0)
+                layer_meta = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=decode_cm,
+                )
+                for layer_name in attn_group.layer_names:
+                    decode_attn_metadata[layer_name] = layer_meta
+
+            slot_by_layer = {ln: slot_mapping for ln in kv_cache_group.layer_names}
+
+            # 4d. Forward pass
+            with set_forward_context(
+                decode_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_active,
+                slot_mapping=slot_by_layer,
+            ):
+                hidden_states = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                )
+
+            logits = self.model.compute_logits(hidden_states)  # [num_active, V]
+
+            # 5a. GPU beam selection
+            parent_indices, cand_tokens, cand_logprobs = gpu_beam_select(
+                logits,
+                state.cum_logprobs[:num_active],
+                beam_width,
+            )
+
+            # 5b. EOS handling — small GPU→CPU transfer (~340 bytes)
+            is_eos = cand_tokens == eos_token_id
+            parent_cpu = parent_indices.cpu().tolist()
+            tokens_cpu = cand_tokens.cpu().tolist()
+            logprobs_cpu = cand_logprobs.cpu().tolist()
+            eos_cpu = is_eos.cpu().tolist()
+
+            active_parents: list[int] = []
+            active_tokens_list: list[int] = []
+            active_logprobs_list: list[float] = []
+
+            for i in range(len(parent_cpu)):
+                if eos_cpu[i] and not ignore_eos:
+                    p = parent_cpu[i]
+                    seq = state.token_ids[p, : token_col + 1].cpu().tolist()
+                    seq.append(tokens_cpu[i])
+                    state.completed.append(
+                        BeamSearchSequence(
+                            tokens=seq,
+                            logprobs=[],
+                            cum_logprob=logprobs_cpu[i],
+                        )
+                    )
+                else:
+                    if len(active_parents) < beam_width:
+                        active_parents.append(parent_cpu[i])
+                        active_tokens_list.append(tokens_cpu[i])
+                        active_logprobs_list.append(logprobs_cpu[i])
+
+            new_num_active = len(active_parents)
+            if new_num_active == 0:
+                break
+
+            # 5c. Write new tokens + update cumulative logprobs
+            next_col = token_col + 1
+            parent_tensor = torch.tensor(
+                active_parents,
+                dtype=torch.long,
+                device=device,
+            )
+            new_tokens_t = torch.tensor(
+                active_tokens_list,
+                dtype=torch.long,
+                device=device,
+            )
+            new_logprobs_t = torch.tensor(
+                active_logprobs_list,
+                dtype=torch.float32,
+                device=device,
+            )
+
+            # Reorder token history based on parent indices
+            new_token_ids = state.token_ids[parent_tensor]
+            new_token_ids[:new_num_active, next_col] = new_tokens_t
+            state.token_ids[:new_num_active] = new_token_ids[:new_num_active]
+            state.cum_logprobs[:new_num_active] = new_logprobs_t
+
+            # 5d. KV cache block table reindexing
+            old_bt = beam_bt_np[:num_active].copy()
+            new_bt = old_bt[active_parents]
+
+            next_block_idx = next_col // block_size
+            next_block_offset = next_col % block_size
+
+            if next_block_offset > 0:
+                # Mid-block: check for write conflicts
+                current_blocks = new_bt[:, next_block_idx].tolist()
+                seen: dict[int, int] = {}
+                copy_pairs: list[tuple[int, int]] = []
+
+                for i in range(new_num_active):
+                    blk = current_blocks[i]
+                    if blk in seen:
+                        new_blk = spare_blocks.popleft()
+                        copy_pairs.append((blk, new_blk))
+                        new_bt[i, next_block_idx] = new_blk
+                    else:
+                        seen[blk] = i
+
+                if copy_pairs:
+                    block_mapping = torch.tensor(
+                        copy_pairs,
+                        dtype=torch.int64,
+                    )
+                    for kv_cache in self.kv_caches:
+                        blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
+                        ops.swap_blocks(
+                            kv_cache,
+                            kv_cache,
+                            blk_bytes,
+                            block_mapping,
+                        )
+            else:
+                # At block boundary: allocate fresh blocks
+                for i in range(new_num_active):
+                    new_blk = spare_blocks.popleft()
+                    new_bt[i, next_block_idx] = new_blk
+
+            beam_bt_np[:new_num_active] = new_bt[:new_num_active]
+            beam_bt_gpu[:new_num_active] = torch.from_numpy(new_bt[:new_num_active]).to(
+                device
+            )
+
+            num_active = new_num_active
+
+        # --- Block 6: Collect results ---
+        # Add remaining active beams
+        final_col = prompt_len + min(step + 1, max_tokens)
+        for b in range(num_active):
+            seq = state.token_ids[b, :final_col].cpu().tolist()
+            state.completed.append(
+                BeamSearchSequence(
+                    tokens=seq,
+                    logprobs=[],
+                    cum_logprob=float(state.cum_logprobs[b].item()),
+                )
+            )
+
+        sort_key = create_sort_beams_key_function(
+            eos_token_id,
+            length_penalty,
+        )
+        state.completed.sort(key=sort_key, reverse=True)
+        best_beams = state.completed[:beam_width]
+
+        return BeamSearchOutput(sequences=best_beams)
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig

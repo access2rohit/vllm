@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from vllm.logprobs import Logprob
 from vllm.lora.request import LoRARequest
 
@@ -86,3 +88,106 @@ def create_sort_beams_key_function(eos_token_id: int, length_penalty: float):
         )
 
     return sort_beams_key
+
+
+# ============================================================
+# Tier 3: GPU-Resident Beam Search Components
+# ============================================================
+
+
+@dataclass
+class BeamSearchConfig:
+    """Immutable configuration for GPU-resident beam search.
+    Sent from the engine to the worker once per beam search request.
+    """
+
+    beam_width: int
+    max_tokens: int
+    eos_token_id: int
+    length_penalty: float = 1.0
+    ignore_eos: bool = False
+    temperature: float = 0.0
+    prompt_token_ids: list[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.prompt_token_ids is None:
+            self.prompt_token_ids = []
+
+
+@dataclass
+class BeamSearchState:
+    """Mutable GPU-resident state for beam search.
+    All tensors live on GPU throughout the beam search loop.
+    """
+
+    # [beam_width, prompt_len + max_tokens], int64 — full token sequences
+    token_ids: torch.Tensor
+    # [beam_width], float32 — cumulative log probabilities
+    cum_logprobs: torch.Tensor
+    # Number of currently active (non-completed) beams
+    num_active: int
+    # Completed beams (moved to CPU as they finish)
+    completed: list[BeamSearchSequence]
+
+    @staticmethod
+    def initialize(
+        prompt_token_ids: list[int],
+        beam_width: int,
+        max_tokens: int,
+        device: torch.device,
+    ) -> "BeamSearchState":
+        """Create initial beam state from prompt tokens."""
+        prompt_len = len(prompt_token_ids)
+        total_len = prompt_len + max_tokens
+
+        # All beams start with the same prompt
+        token_ids = torch.zeros(beam_width, total_len, dtype=torch.long, device=device)
+        prompt_tensor = torch.tensor(prompt_token_ids, dtype=torch.long, device=device)
+        # Fill prompt into all beam rows
+        token_ids[:, :prompt_len] = prompt_tensor.unsqueeze(0)
+
+        cum_logprobs = torch.zeros(beam_width, dtype=torch.float32, device=device)
+
+        return BeamSearchState(
+            token_ids=token_ids,
+            cum_logprobs=cum_logprobs,
+            num_active=1,  # Start with 1 beam, expand after first step
+            completed=[],
+        )
+
+
+@torch.no_grad()
+def gpu_beam_select(
+    logits: torch.Tensor,
+    cum_logprobs: torch.Tensor,
+    beam_width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure GPU beam selection. 4 ops, ~0.02ms on A100.
+
+    Args:
+        logits: [num_beams, vocab_size] raw logits from model
+        cum_logprobs: [num_beams] current cumulative log probabilities
+        beam_width: number of beams to keep
+
+    Returns:
+        parent_indices: [2 * beam_width] which old beam each candidate came from
+        token_ids: [2 * beam_width] selected token for each candidate
+        new_cum_logprobs: [2 * beam_width] updated cumulative logprobs
+    """
+    # 1. log_softmax -> logprobs
+    logprobs = torch.log_softmax(logits.float(), dim=-1)
+
+    # 2. broadcast-add cumulative logprobs
+    combined = logprobs + cum_logprobs.unsqueeze(1)
+
+    # 3. flatten + topk (2x candidates like HuggingFace)
+    flat = combined.reshape(-1)
+    vocab_size = logits.shape[-1]
+    k = min(2 * beam_width, flat.shape[0])
+    topk_values, topk_indices = torch.topk(flat, k)
+
+    # 4. decode parent beam and token from flat index
+    parent_indices = topk_indices // vocab_size
+    token_ids = topk_indices % vocab_size
+
+    return parent_indices, token_ids, topk_values

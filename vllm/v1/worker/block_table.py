@@ -125,6 +125,12 @@ class BlockTable:
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
 
+    def copy_row(self, src: int, tgt: int) -> None:
+        """Copy block table row from src to tgt (one-directional, no swap)."""
+        num_blocks = self.num_blocks_per_row[src]
+        self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
+        self.num_blocks_per_row[tgt] = num_blocks
+
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
@@ -314,6 +320,10 @@ class MultiGroupBlockTable:
     def move_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:
             block_table.move_row(src, tgt)
+
+    def copy_row(self, src: int, tgt: int) -> None:
+        for block_table in self.block_tables:
+            block_table.copy_row(src, tgt)
 
     def swap_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:
