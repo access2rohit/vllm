@@ -416,12 +416,24 @@ class LLMEngine:
     def execute_beam_search(self, config):
         """Execute GPU-resident beam search through collective_rpc.
         This works with all client types (InprocClient, SyncMPClient, etc.)
+        Converts BeamSearchConfig to dict for msgpack serialization,
+        and reconstructs BeamSearchOutput from the returned dict.
         """
+        from dataclasses import asdict
+
+        from vllm.beam_search import BeamSearchOutput, BeamSearchSequence
+
+        config_dict = asdict(config) if not isinstance(config, dict) else config
         results = self.collective_rpc(
             "execute_beam_search",
-            args=(config,),
+            args=(config_dict,),
         )
-        return results[0]
+        result_dict = results[0]
+        # Reconstruct BeamSearchOutput from dict
+        if isinstance(result_dict, dict):
+            sequences = [BeamSearchSequence(**seq) for seq in result_dict["sequences"]]
+            return BeamSearchOutput(sequences=sequences)
+        return result_dict
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))

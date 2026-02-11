@@ -677,8 +677,19 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def execute_beam_search(self, config):
-        """Delegate beam search to the model runner."""
-        return self.model_runner.execute_beam_search(config)
+        """Delegate beam search to the model runner.
+        config is a dict with beam search parameters (msgpack-safe).
+        Returns a dict (msgpack-safe) that LLMEngine reconstructs.
+        """
+        from dataclasses import asdict
+
+        from vllm.beam_search import BeamSearchConfig
+
+        if isinstance(config, dict):
+            config = BeamSearchConfig(**config)
+        result = self.model_runner.execute_beam_search(config)
+        # Convert BeamSearchOutput to dict for msgpack serialization
+        return asdict(result)
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:
