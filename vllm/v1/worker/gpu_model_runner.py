@@ -5791,6 +5791,12 @@ class GPUModelRunner(
         assert len(self.kv_cache_config.kv_cache_groups) == 1, (
             "GPU beam search currently supports single KV cache group only"
         )
+        assert self.vllm_config.parallel_config.data_parallel_size <= 1, (
+            "GPU beam search does not support data parallelism"
+        )
+        assert self.vllm_config.parallel_config.pipeline_parallel_size <= 1, (
+            "GPU beam search does not support pipeline parallelism"
+        )
         kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
 
         # --- Get block size from config ---
