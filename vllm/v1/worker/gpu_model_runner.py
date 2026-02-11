@@ -5809,9 +5809,9 @@ class GPUModelRunner(
         max_gen_blocks = cdiv(max_tokens, block_size)
         total_seq_blocks = num_prompt_blocks + max_gen_blocks
 
-        # Worst case blocks: prompt (shared) + beam_width * gen blocks
-        # + 2x spare for copy-on-write conflicts during beam reindexing
-        total_blocks_needed = num_prompt_blocks + beam_width * max_gen_blocks * 2
+        # Upper bound on blocks: prompt (shared) + initial gen blocks +
+        # at most one new block per beam per step (block boundary or CoW).
+        total_blocks_needed = num_prompt_blocks + beam_width + beam_width * max_tokens
 
         # Verify we have enough KV cache blocks
         num_kv_blocks = self.kv_cache_config.num_blocks // len(
