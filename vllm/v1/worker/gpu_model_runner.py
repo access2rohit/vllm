@@ -5805,6 +5805,16 @@ class GPUModelRunner(
             num_prompt_blocks + beam_width * max_gen_blocks + beam_width
         )
         total_seq_blocks = num_prompt_blocks + max_gen_blocks
+
+        # Verify we have enough KV cache blocks
+        num_kv_blocks = self.kv_cache_config.num_blocks // len(
+            self.kv_cache_config.kv_cache_groups
+        )
+        assert total_blocks_needed <= num_kv_blocks, (
+            f"Beam search needs {total_blocks_needed} blocks but only "
+            f"{num_kv_blocks} available. Reduce beam_width or max_tokens."
+        )
+
         spare_blocks = deque(range(total_blocks_needed))
 
         # --- Initialize beam state ---
@@ -5928,6 +5938,7 @@ class GPUModelRunner(
 
         # --- Block 4-5: Main decode loop ---
         num_active = beam_width
+        last_step = 0
 
         for step in range(max_tokens):
             if num_active == 0:
@@ -6117,10 +6128,11 @@ class GPUModelRunner(
             )
 
             num_active = new_num_active
+            last_step = step
 
         # --- Block 6: Collect results ---
         # Add remaining active beams
-        final_col = prompt_len + min(step + 1, max_tokens)
+        final_col = prompt_len + last_step + 1
         for b in range(num_active):
             seq = state.token_ids[b, :final_col].cpu().tolist()
             state.completed.append(
