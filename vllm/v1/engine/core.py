@@ -431,15 +431,6 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
-    def execute_beam_search(self, config):
-        """Execute GPU-resident beam search via the executor.
-
-        This bypasses the normal scheduler loop entirely. The worker
-        runs the full beam search loop internally and returns the
-        final BeamSearchOutput.
-        """
-        return self.model_executor.execute_beam_search(config)
-
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:

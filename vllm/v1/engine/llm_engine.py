@@ -414,8 +414,14 @@ class LLMEngine:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
     def execute_beam_search(self, config):
-        """Execute GPU-resident beam search through the engine core."""
-        return self.engine_core.execute_beam_search(config)
+        """Execute GPU-resident beam search through collective_rpc.
+        This works with all client types (InprocClient, SyncMPClient, etc.)
+        """
+        results = self.collective_rpc(
+            "execute_beam_search",
+            args=(config,),
+        )
+        return results[0]
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))

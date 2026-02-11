@@ -179,9 +179,6 @@ class EngineCoreClient(ABC):
     def pin_lora(self, lora_id: int) -> bool:
         raise NotImplementedError
 
-    def execute_beam_search(self, config: Any) -> Any:
-        raise NotImplementedError
-
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
@@ -337,10 +334,6 @@ class InprocClient(EngineCoreClient):
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.engine_core.pin_lora(lora_id)
-
-    def execute_beam_search(self, config):
-        """Execute GPU-resident beam search."""
-        return self.engine_core.execute_beam_search(config)
 
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
