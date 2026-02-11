@@ -5801,10 +5801,11 @@ class GPUModelRunner(
         # Use block IDs starting from 0.
         num_prompt_blocks = cdiv(prompt_len, block_size)
         max_gen_blocks = cdiv(max_tokens, block_size)
-        total_blocks_needed = (
-            num_prompt_blocks + beam_width * max_gen_blocks + beam_width
-        )
         total_seq_blocks = num_prompt_blocks + max_gen_blocks
+
+        # Worst case blocks: prompt (shared) + beam_width * gen blocks
+        # + 2x spare for copy-on-write conflicts during beam reindexing
+        total_blocks_needed = num_prompt_blocks + beam_width * max_gen_blocks * 2
 
         # Verify we have enough KV cache blocks
         num_kv_blocks = self.kv_cache_config.num_blocks // len(
@@ -6055,6 +6056,7 @@ class GPUModelRunner(
 
             new_num_active = len(active_parents)
             if new_num_active == 0:
+                num_active = 0
                 break
 
             # 5c. Write new tokens + update cumulative logprobs
@@ -6109,13 +6111,20 @@ class GPUModelRunner(
                         dtype=torch.int64,
                     )
                     for kv_cache in self.kv_caches:
-                        blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
-                        ops.swap_blocks(
-                            kv_cache,
-                            kv_cache,
-                            blk_bytes,
-                            block_mapping,
-                        )
+                        if kv_cache.dim() >= 2 and kv_cache.shape[0] == 2:
+                            # Combined K/V tensor: [2, num_blocks, ...]
+                            # Split and copy each separately
+                            k_cache = kv_cache[0]
+                            v_cache = kv_cache[1]
+                            blk_bytes = k_cache.element_size() * k_cache.stride(0)
+                            ops.swap_blocks(k_cache, k_cache, blk_bytes, block_mapping)
+                            ops.swap_blocks(v_cache, v_cache, blk_bytes, block_mapping)
+                        else:
+                            # Separate cache tensor: [num_blocks, ...]
+                            blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
+                            ops.swap_blocks(
+                                kv_cache, kv_cache, blk_bytes, block_mapping
+                            )
             else:
                 # At block boundary: allocate fresh blocks
                 for i in range(new_num_active):
