@@ -656,12 +656,6 @@ class LLM:
     ) -> list[BeamSearchOutput]:
         """GPU-resident beam search. Runs the entire beam search loop
         inside the worker, minimizing GPU<->CPU transfers."""
-        from math import ceil
-
-        beam_width = params.beam_width
-        max_tokens = params.max_tokens
-        block_size = self.llm_engine.cache_config.block_size
-
         outputs = []
         for prompt in prompts:
             if "prompt_token_ids" in prompt:
@@ -670,26 +664,9 @@ class LLM:
             else:
                 prompt_tokens = tokenizer.encode(prompt["prompt"])
 
-            prompt_len = len(prompt_tokens)
-
-            # Calculate blocks needed
-            num_prompt_blocks = ceil(prompt_len / block_size)
-            max_gen_blocks = ceil(max_tokens / block_size)
-            # prompt blocks (shared) + beam_width * gen blocks + spare
-            total_blocks = (
-                num_prompt_blocks
-                + beam_width * max_gen_blocks
-                + beam_width  # spare for copy-on-write
-            )
-
-            # Allocate blocks from the scheduler
-            block_ids = self.llm_engine.allocate_beam_search_blocks(
-                total_blocks,
-            )
-
             config = BeamSearchConfig(
-                beam_width=beam_width,
-                max_tokens=max_tokens,
+                beam_width=params.beam_width,
+                max_tokens=params.max_tokens,
                 eos_token_id=tokenizer.eos_token_id,
                 length_penalty=params.length_penalty,
                 ignore_eos=params.ignore_eos,
@@ -697,21 +674,13 @@ class LLM:
                 prompt_token_ids=prompt_tokens,
             )
 
-            try:
-                result = self.llm_engine.execute_beam_search(
-                    config,
-                    block_ids,
-                    block_size,
-                )
+            result = self.llm_engine.execute_beam_search(config)
 
-                # Decode text for the output beams
-                for beam in result.sequences:
-                    beam.text = tokenizer.decode(beam.tokens)
+            # Decode text for the output beams
+            for beam in result.sequences:
+                beam.text = tokenizer.decode(beam.tokens)
 
-                outputs.append(result)
-            finally:
-                # Free blocks back to the pool
-                self.llm_engine.free_beam_search_blocks(block_ids)
+            outputs.append(result)
 
         return outputs
 

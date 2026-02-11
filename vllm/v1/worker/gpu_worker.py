@@ -676,13 +676,9 @@ class Worker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     @torch.inference_mode()
-    def execute_beam_search(self, config, block_ids, block_size):
+    def execute_beam_search(self, config):
         """Delegate beam search to the model runner."""
-        return self.model_runner.execute_beam_search(
-            config,
-            block_ids,
-            block_size,
-        )
+        return self.model_runner.execute_beam_search(config)
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:

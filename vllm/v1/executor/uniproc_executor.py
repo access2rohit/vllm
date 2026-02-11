@@ -117,11 +117,11 @@ class UniProcExecutor(Executor):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.collective_rpc("take_draft_token_ids", single_value=True)
 
-    def execute_beam_search(self, config, block_ids, block_size):
+    def execute_beam_search(self, config):
         """Route beam search to the worker."""
         return self.collective_rpc(
             "execute_beam_search",
-            args=(config, block_ids, block_size),
+            args=(config,),
             single_value=True,
         )
 

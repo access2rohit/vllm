@@ -5761,8 +5761,6 @@ class GPUModelRunner(
     def execute_beam_search(
         self,
         config: BeamSearchConfig,
-        block_ids: list[int],
-        block_size: int,
     ) -> BeamSearchOutput:
         """Run the entire beam search loop inside the worker.
 
@@ -5770,11 +5768,11 @@ class GPUModelRunner(
         next-token feeding all happen on GPU. Only the final result
         crosses GPU→CPU.
 
+        Block IDs are self-allocated from a simple range since beam search
+        runs exclusively (no other requests active).
+
         Args:
             config: Immutable beam search configuration.
-            block_ids: Pre-allocated block IDs from the scheduler.
-                       Enough for beam_width * max_gen_blocks + spare.
-            block_size: KV cache block size.
         """
         from collections import deque
 
@@ -5795,11 +5793,19 @@ class GPUModelRunner(
         )
         kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
 
-        # --- Block management ---
-        spare_blocks = deque(block_ids)
-        max_gen_blocks = cdiv(max_tokens, block_size)
-        total_seq_blocks = cdiv(prompt_len, block_size) + max_gen_blocks
+        # --- Get block size from config ---
+        block_size = self.cache_config.block_size
+
+        # --- Self-allocate block IDs ---
+        # During beam search, we have exclusive access to the KV cache.
+        # Use block IDs starting from 0.
         num_prompt_blocks = cdiv(prompt_len, block_size)
+        max_gen_blocks = cdiv(max_tokens, block_size)
+        total_blocks_needed = (
+            num_prompt_blocks + beam_width * max_gen_blocks + beam_width
+        )
+        total_seq_blocks = num_prompt_blocks + max_gen_blocks
+        spare_blocks = deque(range(total_blocks_needed))
 
         # --- Initialize beam state ---
         state = BeamSearchState.initialize(

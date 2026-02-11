@@ -413,19 +413,9 @@ class LLMEngine:
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
-    def execute_beam_search(self, config, block_ids, block_size):
+    def execute_beam_search(self, config):
         """Execute GPU-resident beam search through the engine core."""
-        return self.engine_core.execute_beam_search(
-            config,
-            block_ids,
-            block_size,
-        )
-
-    def allocate_beam_search_blocks(self, num_blocks):
-        return self.engine_core.allocate_beam_search_blocks(num_blocks)
-
-    def free_beam_search_blocks(self, block_ids):
-        return self.engine_core.free_beam_search_blocks(block_ids)
+        return self.engine_core.execute_beam_search(config)
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))

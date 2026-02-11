@@ -431,37 +431,14 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
-    def execute_beam_search(self, config, block_ids, block_size):
+    def execute_beam_search(self, config):
         """Execute GPU-resident beam search via the executor.
 
         This bypasses the normal scheduler loop entirely. The worker
         runs the full beam search loop internally and returns the
         final BeamSearchOutput.
         """
-        return self.model_executor.execute_beam_search(
-            config,
-            block_ids,
-            block_size,
-        )
-
-    def allocate_beam_search_blocks(self, num_blocks: int) -> list[int]:
-        """Allocate blocks from the KV cache for beam search.
-
-        Returns a list of physical block IDs.
-        """
-        kv_cache_manager = self.scheduler.kv_cache_manager
-        blocks = kv_cache_manager.block_pool.get_new_blocks(num_blocks)
-        return [b.block_id for b in blocks]
-
-    def free_beam_search_blocks(self, block_ids: list[int]) -> None:
-        """Free blocks allocated for beam search."""
-        kv_cache_manager = self.scheduler.kv_cache_manager
-        pool = kv_cache_manager.block_pool
-        for block_id in block_ids:
-            block = pool.blocks[block_id]
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0:
-                pool.free_block_queue.appendleft(block)
+        return self.model_executor.execute_beam_search(config)
 
     def step_with_batch_queue(
         self,
