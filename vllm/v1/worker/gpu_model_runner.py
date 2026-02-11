@@ -6085,11 +6085,19 @@ class GPUModelRunner(
 
             # Reorder token history based on parent indices
             new_token_ids = state.token_ids[parent_tensor]
-            new_token_ids[:new_num_active, next_col] = new_tokens_t
+            # Only write next token if there's room (not the last step)
+            if next_col < state.token_ids.shape[1]:
+                new_token_ids[:new_num_active, next_col] = new_tokens_t
             state.token_ids[:new_num_active] = new_token_ids[:new_num_active]
             state.cum_logprobs[:new_num_active] = new_logprobs_t
 
             # 5d. KV cache block table reindexing
+            # Skip if this is the last step (no next forward pass)
+            if next_col >= state.token_ids.shape[1]:
+                num_active = new_num_active
+                last_step = step
+                break
+
             old_bt = beam_bt_np[:num_active].copy()
             new_bt = old_bt[active_parents]
 
