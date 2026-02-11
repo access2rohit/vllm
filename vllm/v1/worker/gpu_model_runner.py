@@ -5869,7 +5869,7 @@ class GPUModelRunner(
         # Attention metadata for prefill (single sequence)
         prefill_seq_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
         prefill_query_start_loc = torch.tensor(
-            [0, prompt_len], dtype=torch.int64, device=device
+            [0, prompt_len], dtype=torch.int32, device=device
         )
 
         prefill_cm = CommonAttentionMetadata(
@@ -5975,7 +5975,7 @@ class GPUModelRunner(
             )
             query_start_loc = torch.arange(
                 num_active + 1,
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=device,
             )
 
