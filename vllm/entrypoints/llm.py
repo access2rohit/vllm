@@ -627,14 +627,24 @@ class LLM:
         has_lora = lora_request is not None
         has_multimodal = any("multi_modal_data" in p for p in prompts)
 
-        if not has_lora and not has_multimodal:
-            # GPU-resident beam search (Tier 3)
-            return self._beam_search_gpu_resident(
-                prompts,
-                params,
-                tokenizer,
-                sort_beams_key,
-            )
+        # GPU-resident path requires: no LoRA, no multimodal, single KV group
+        use_gpu_path = not has_lora and not has_multimodal
+
+        if use_gpu_path:
+            try:
+                return self._beam_search_gpu_resident(
+                    prompts,
+                    params,
+                    tokenizer,
+                    sort_beams_key,
+                )
+            except Exception as e:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "GPU-resident beam search failed (%s), falling back to CPU loop.",
+                    e,
+                )
 
         # Fallback: original CPU-loop beam search
         return self._beam_search_cpu_loop(
