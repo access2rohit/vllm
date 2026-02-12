@@ -627,8 +627,13 @@ class LLM:
         has_lora = lora_request is not None
         has_multimodal = any("multi_modal_data" in p for p in prompts)
 
+        # Allow forcing CPU path via environment variable for debugging
+        import os
+
+        force_cpu = os.environ.get("VLLM_BEAM_SEARCH_CPU", "0") == "1"
+
         # GPU-resident path requires: no LoRA, no multimodal, single KV group
-        use_gpu_path = not has_lora and not has_multimodal
+        use_gpu_path = not has_lora and not has_multimodal and not force_cpu
 
         if use_gpu_path:
             try:
