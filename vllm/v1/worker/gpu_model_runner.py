@@ -5788,18 +5788,22 @@ class GPUModelRunner(
         length_penalty = config.length_penalty
 
         # --- Validate assumptions ---
-        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
-            "GPU beam search currently supports single KV cache group only"
-        )
         assert self.vllm_config.parallel_config.data_parallel_size <= 1, (
             "GPU beam search does not support data parallelism"
         )
         assert self.vllm_config.parallel_config.pipeline_parallel_size <= 1, (
             "GPU beam search does not support pipeline parallelism"
         )
-        kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
 
-        # --- Get block size from config ---
+        # --- Multi-group KV cache support ---
+        # Each KV cache group may have different block sizes and layer sets.
+        # We create per-group block tables and slot mappings.
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        num_kv_groups = len(kv_cache_groups)
+
+        # Use the first group's block size for block allocation math.
+        # All groups share the same physical block pool, so we allocate
+        # based on the primary block size.
         block_size = self.cache_config.block_size
 
         # --- Self-allocate block IDs ---
@@ -5872,7 +5876,9 @@ class GPUModelRunner(
             [0, prompt_len], dtype=torch.int32, device=device
         )
 
-        prefill_cm = CommonAttentionMetadata(
+        # Base CommonAttentionMetadata shared across all KV cache groups.
+        # Per-group block_table and slot_mapping are swapped in below.
+        prefill_cm_base = CommonAttentionMetadata(
             query_start_loc=prefill_query_start_loc,
             query_start_loc_cpu=prefill_query_start_loc.cpu(),
             seq_lens=prefill_seq_lens,
@@ -5887,21 +5893,26 @@ class GPUModelRunner(
             causal=True,
         )
 
-        # Build per-layer attention metadata
+        # Build per-layer attention metadata for ALL KV cache groups.
+        # Each group may have different layers but shares the same block
+        # table and slot mapping (all groups use the same block pool).
         prefill_attn_metadata = {}
-        for attn_group in self.attn_groups[0]:
-            builder = attn_group.get_metadata_builder(0)
-            layer_meta = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=prefill_cm,
-            )
-            for layer_name in attn_group.layer_names:
-                prefill_attn_metadata[layer_name] = layer_meta
-
-        # Build slot_mapping dict keyed by layer name
-        prefill_slot_by_layer = {
-            ln: prefill_slot_mapping for ln in kv_cache_group.layer_names
-        }
+        prefill_slot_by_layer = {}
+        for kv_cache_gid, kv_group in enumerate(kv_cache_groups):
+            # All groups share the same block table and slot mapping
+            # because they use the same physical block pool.
+            cm = copy(prefill_cm_base)
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                builder = attn_group.get_metadata_builder(0)
+                layer_meta = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=cm,
+                )
+                for layer_name in attn_group.layer_names:
+                    prefill_attn_metadata[layer_name] = layer_meta
+            # Map each layer in this group to the slot mapping
+            for ln in kv_group.layer_names:
+                prefill_slot_by_layer[ln] = prefill_slot_mapping
 
         # Run prefill forward pass
         with set_forward_context(
@@ -5979,7 +5990,10 @@ class GPUModelRunner(
                 device=device,
             )
 
-            decode_cm = CommonAttentionMetadata(
+            # Base CommonAttentionMetadata for decode step.
+            # Shared across all KV cache groups (block table and slot mapping
+            # are the same since all groups use the same block pool).
+            decode_cm_base = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc.cpu(),
                 seq_lens=attn_seq_lens,
@@ -5998,17 +6012,24 @@ class GPUModelRunner(
                 causal=True,
             )
 
+            # Build per-layer attention metadata for ALL KV cache groups
             decode_attn_metadata = {}
-            for attn_group in self.attn_groups[0]:
-                builder = attn_group.get_metadata_builder(0)
-                layer_meta = builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=decode_cm,
-                )
-                for layer_name in attn_group.layer_names:
-                    decode_attn_metadata[layer_name] = layer_meta
+            for kv_cache_gid in range(num_kv_groups):
+                cm = copy(decode_cm_base)
+                for attn_group in self.attn_groups[kv_cache_gid]:
+                    builder = attn_group.get_metadata_builder(0)
+                    layer_meta = builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=cm,
+                    )
+                    for layer_name in attn_group.layer_names:
+                        decode_attn_metadata[layer_name] = layer_meta
 
-            slot_by_layer = {ln: slot_mapping for ln in kv_cache_group.layer_names}
+            # Build slot_mapping dict covering ALL groups' layers
+            slot_by_layer = {}
+            for kv_group in kv_cache_groups:
+                for ln in kv_group.layer_names:
+                    slot_by_layer[ln] = slot_mapping
 
             # 4d. Forward pass
             with set_forward_context(
