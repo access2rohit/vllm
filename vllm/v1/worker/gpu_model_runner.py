@@ -5857,8 +5857,9 @@ class GPUModelRunner(
 
         # --- Prefill: run the prompt through the model ---
         # Build input tensors for the full prompt
+        # NOTE: input_ids must be int32 to match normal vLLM path
         input_ids_prefill = torch.tensor(
-            prompt_token_ids, dtype=torch.long, device=device
+            prompt_token_ids, dtype=torch.int32, device=device
         )
         positions_prefill = torch.arange(prompt_len, dtype=torch.long, device=device)
 
@@ -5997,7 +5998,10 @@ class GPUModelRunner(
             seq_len_after = token_col + 1
 
             # 4a. Build input tensors
-            input_ids = state.token_ids[:num_active, token_col].contiguous()
+            # NOTE: input_ids must be int32 to match normal vLLM path
+            input_ids = (
+                state.token_ids[:num_active, token_col].to(torch.int32).contiguous()
+            )
             positions = torch.full(
                 (num_active,), token_col, dtype=torch.long, device=device
             )
