@@ -5945,10 +5945,41 @@ class GPUModelRunner(
         state.num_active = beam_width
 
         # --- Block 3: Expand block table for all beams ---
-        # Allocate generation blocks for beams 1..beam_width-1
+        # The last prompt block may also hold generation tokens (when
+        # prompt_len is not a multiple of block_size). Each beam needs
+        # its own copy of this block to avoid write conflicts.
+        last_prompt_block_idx = num_prompt_blocks - 1
+        prompt_ends_mid_block = (prompt_len % block_size) != 0
+
         for b in range(1, beam_width):
-            gen_block = spare_blocks.popleft()
+            # Copy prompt block IDs (all blocks except possibly the last)
             beam_bt_np[b, :num_prompt_blocks] = prompt_block_ids
+
+            if prompt_ends_mid_block:
+                # The last prompt block will also hold generation tokens.
+                # Give each beam its own copy of this block.
+                new_last_blk = spare_blocks.popleft()
+                beam_bt_np[b, last_prompt_block_idx] = new_last_blk
+
+                # Copy the KV data from beam 0's last prompt block
+                # to this beam's new block.
+                block_mapping = torch.tensor(
+                    [[prompt_block_ids[last_prompt_block_idx], new_last_blk]],
+                    dtype=torch.int64,
+                )
+                for kv_cache in self.kv_caches:
+                    if kv_cache.dim() >= 2 and kv_cache.shape[0] == 2:
+                        k_cache = kv_cache[0]
+                        v_cache = kv_cache[1]
+                        blk_bytes = k_cache.element_size() * k_cache.stride(0)
+                        ops.swap_blocks(k_cache, k_cache, blk_bytes, block_mapping)
+                        ops.swap_blocks(v_cache, v_cache, blk_bytes, block_mapping)
+                    else:
+                        blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
+                        ops.swap_blocks(kv_cache, kv_cache, blk_bytes, block_mapping)
+
+            # Allocate a generation block for this beam
+            gen_block = spare_blocks.popleft()
             beam_bt_np[b, num_prompt_blocks] = gen_block
 
         # Beam 0 already has its gen block from above
