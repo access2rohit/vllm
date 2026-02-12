@@ -5940,6 +5940,18 @@ class GPUModelRunner(
             logprobs[0], beam_width
         )  # [beam_width]
 
+        # DEBUG: verify prefill produces sensible logits
+        logger.warning(
+            "BEAM_DEBUG prefill: hidden_states shape=%s, logits shape=%s, "
+            "top4 tokens=%s, top4 logprobs=%s, logits min/max=%.4f/%.4f",
+            hidden_states.shape,
+            logits.shape,
+            topk_indices.cpu().tolist(),
+            topk_logprobs.cpu().tolist(),
+            logits.min().item(),
+            logits.max().item(),
+        )
+
         # Write first generated tokens
         state.token_ids[:beam_width, prompt_len] = topk_indices
         state.cum_logprobs[:beam_width] = topk_logprobs
@@ -6079,6 +6091,19 @@ class GPUModelRunner(
                 )
 
             logits = self.model.compute_logits(hidden_states)  # [num_active, V]
+
+            # DEBUG: log first decode step
+            if step == 0:
+                logger.warning(
+                    "BEAM_DEBUG step0: input_ids=%s, logits shape=%s, "
+                    "logits[0] min/max=%.4f/%.4f, "
+                    "top4=%s",
+                    input_ids.cpu().tolist(),
+                    logits.shape,
+                    logits[0].min().item(),
+                    logits[0].max().item(),
+                    torch.topk(logits[0], 4).indices.cpu().tolist(),
+                )
 
             # 5a. GPU beam selection
             parent_indices, cand_tokens, cand_logprobs = gpu_beam_select(
