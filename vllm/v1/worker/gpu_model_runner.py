@@ -6146,6 +6146,22 @@ class GPUModelRunner(
                 num_active = 0
                 break
 
+            # DEBUG: log beam reindexing for first 3 steps
+            if step < 3:
+                logger.warning(
+                    "BEAM_DEBUG step%d reindex: parents=%s, "
+                    "active_tokens=%s, next_col=%d, "
+                    "bt_before[0]=%s, bt_before[1]=%s",
+                    step,
+                    active_parents,
+                    active_tokens_list,
+                    token_col + 1,
+                    beam_bt_np[0, :num_prompt_blocks + 3].tolist(),
+                    beam_bt_np[1, :num_prompt_blocks + 3].tolist()
+                    if num_active > 1
+                    else "N/A",
+                )
+
             # 5c. Write new tokens + update cumulative logprobs
             next_col = token_col + 1
             parent_tensor = torch.tensor(
@@ -6184,12 +6200,12 @@ class GPUModelRunner(
 
             next_block_idx = next_col // block_size
             next_block_offset = next_col % block_size
+            copy_pairs: list[tuple[int, int]] = []
 
             if next_block_offset > 0:
                 # Mid-block: check for write conflicts
                 current_blocks = new_bt[:, next_block_idx].tolist()
                 seen: dict[int, int] = {}
-                copy_pairs: list[tuple[int, int]] = []
 
                 for i in range(new_num_active):
                     blk = current_blocks[i]
@@ -6230,6 +6246,22 @@ class GPUModelRunner(
             beam_bt_gpu[:new_num_active] = torch.from_numpy(new_bt[:new_num_active]).to(
                 device
             )
+
+            # DEBUG: log block table after reindexing for first 3 steps
+            if step < 3:
+                logger.warning(
+                    "BEAM_DEBUG step%d after_reindex: "
+                    "bt_after[0]=%s, bt_after[1]=%s, "
+                    "copy_pairs=%s, next_block_idx=%d, next_block_offset=%d",
+                    step,
+                    beam_bt_np[0, :num_prompt_blocks + 3].tolist(),
+                    beam_bt_np[1, :num_prompt_blocks + 3].tolist()
+                    if new_num_active > 1
+                    else "N/A",
+                    copy_pairs if next_block_offset > 0 else "boundary",
+                    next_block_idx,
+                    next_block_offset,
+                )
 
             num_active = new_num_active
             last_step = step
