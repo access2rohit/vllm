@@ -632,7 +632,7 @@ class LLM:
 
         force_cpu = os.environ.get("VLLM_BEAM_SEARCH_CPU", "0") == "1"
 
-        # GPU-resident path requires: no LoRA, no multimodal, single KV group
+        # GPU-resident path requires: no LoRA, no multimodal
         use_gpu_path = not has_lora and not has_multimodal and not force_cpu
 
         if use_gpu_path:
