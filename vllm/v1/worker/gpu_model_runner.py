@@ -5761,6 +5761,8 @@ class GPUModelRunner(
     def execute_beam_search(
         self,
         config: BeamSearchConfig,
+        block_ids: list[int],
+        block_size: int,
     ) -> BeamSearchOutput:
         """Run the entire beam search loop inside the worker.
 
@@ -5768,11 +5770,11 @@ class GPUModelRunner(
         next-token feeding all happen on GPU. Only the final result
         crosses GPU→CPU.
 
-        Block IDs are self-allocated from a simple range since beam search
-        runs exclusively (no other requests active).
-
         Args:
             config: Immutable beam search configuration.
+            block_ids: Pre-allocated block IDs from the scheduler.
+                       Enough for beam_width * max_gen_blocks + spare.
+            block_size: KV cache block size.
         """
         from collections import deque
 
@@ -5788,85 +5790,16 @@ class GPUModelRunner(
         length_penalty = config.length_penalty
 
         # --- Validate assumptions ---
-        assert self.vllm_config.parallel_config.data_parallel_size <= 1, (
-            "GPU beam search does not support data parallelism"
+        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+            "GPU beam search currently supports single KV cache group only"
         )
-        assert self.vllm_config.parallel_config.pipeline_parallel_size <= 1, (
-            "GPU beam search does not support pipeline parallelism"
-        )
+        kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
 
-        # --- KV cache group setup ---
-        # Multi-group models (e.g. gpt-oss-20b with hybrid attention) have
-        # multiple KV cache groups. All groups share the same physical block
-        # pool with uniform page size, so we use a single block table and
-        # slot mapping. The difference is that each group has its own
-        # attention metadata builders that need their own CommonAttentionMetadata.
-        kv_cache_groups = self.kv_cache_config.kv_cache_groups
-        num_kv_groups = len(kv_cache_groups)
-
-        # All groups share the same block size (uniform page size).
-        block_size = self.cache_config.block_size
-
-        # DEBUG: Log multi-group info
-        import logging
-
-        _log = logging.getLogger(__name__)
-        group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
-        _log.warning(
-            "BEAM_SEARCH_DEBUG: num_kv_groups=%d, block_size=%d, "
-            "num_blocks=%d, num_kv_caches=%d, "
-            "group_layers=%s, group_block_sizes=%s, "
-            "kv_cache_shapes=%s",
-            num_kv_groups,
-            block_size,
-            self.kv_cache_config.num_blocks,
-            len(self.kv_caches),
-            [len(g.layer_names) for g in kv_cache_groups],
-            group_block_sizes,
-            [kv.shape for kv in self.kv_caches[:4]],  # first 4 only
-        )
-        # DEBUG: Also log strides
-        _log.warning(
-            "BEAM_SEARCH_DEBUG kv_cache_strides=%s",
-            [kv.stride() for kv in self.kv_caches[:2]],
-        )
-        # DEBUG: Log per-group KV cache spec details
-        for gid, g in enumerate(kv_cache_groups):
-            spec = g.kv_cache_spec
-            _log.warning(
-                "BEAM_SEARCH_DEBUG group %d: spec_type=%s layers=%s "
-                "block_size=%d num_kv_heads=%d head_size=%d "
-                "sliding_window=%s",
-                gid,
-                type(spec).__name__,
-                g.layer_names[:2],
-                spec.block_size,
-                getattr(spec, "num_kv_heads", "N/A"),
-                getattr(spec, "head_size", "N/A"),
-                getattr(spec, "sliding_window", "N/A"),
-            )
-
-        # --- Self-allocate block IDs ---
-        # During beam search, we have exclusive access to the KV cache.
-        # Use block IDs starting from 0.
-        num_prompt_blocks = cdiv(prompt_len, block_size)
+        # --- Block management ---
+        spare_blocks = deque(block_ids)
         max_gen_blocks = cdiv(max_tokens, block_size)
-        total_seq_blocks = num_prompt_blocks + max_gen_blocks
-
-        # Upper bound on blocks: prompt (shared) + initial gen blocks +
-        # at most one new block per beam per step (block boundary or CoW).
-        total_blocks_needed = num_prompt_blocks + beam_width + beam_width * max_tokens
-
-        # Verify we have enough KV cache blocks.
-        # num_blocks is the number of blocks per shared pool (NOT total across
-        # groups). All groups share the same block IDs.
-        num_kv_blocks = self.kv_cache_config.num_blocks
-        assert total_blocks_needed <= num_kv_blocks, (
-            f"Beam search needs {total_blocks_needed} blocks but only "
-            f"{num_kv_blocks} available. Reduce beam_width or max_tokens."
-        )
-
-        spare_blocks = deque(range(total_blocks_needed))
+        total_seq_blocks = cdiv(prompt_len, block_size) + max_gen_blocks
+        num_prompt_blocks = cdiv(prompt_len, block_size)
 
         # --- Initialize beam state ---
         state = BeamSearchState.initialize(
@@ -5896,16 +5829,11 @@ class GPUModelRunner(
         beam_bt_gpu[:] = torch.from_numpy(beam_bt_np).to(device)
 
         # --- Prefill: run the prompt through the model ---
-        # Write input data into persistent buffers (same as normal vLLM path)
-        # This ensures the model sees tensors at the expected memory addresses.
-        self.input_ids.gpu[:prompt_len].copy_(
-            torch.tensor(prompt_token_ids, dtype=torch.int32, device=device)
+        # Build input tensors for the full prompt
+        input_ids_prefill = torch.tensor(
+            prompt_token_ids, dtype=torch.long, device=device
         )
-        self.positions.gpu[:prompt_len].copy_(
-            torch.arange(prompt_len, dtype=torch.long, device=device)
-        )
-        input_ids_prefill = self.input_ids.gpu[:prompt_len]
-        positions_prefill = self.positions.gpu[:prompt_len]
+        positions_prefill = torch.arange(prompt_len, dtype=torch.long, device=device)
 
         # Slot mapping for prefill: each token maps to its block+offset
         prefill_block_indices = positions_prefill // block_size
@@ -5918,12 +5846,10 @@ class GPUModelRunner(
         # Attention metadata for prefill (single sequence)
         prefill_seq_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
         prefill_query_start_loc = torch.tensor(
-            [0, prompt_len], dtype=torch.int32, device=device
+            [0, prompt_len], dtype=torch.int64, device=device
         )
 
-        # Base CommonAttentionMetadata shared across all KV cache groups.
-        # Per-group block_table and slot_mapping are swapped in below.
-        prefill_cm_base = CommonAttentionMetadata(
+        prefill_cm = CommonAttentionMetadata(
             query_start_loc=prefill_query_start_loc,
             query_start_loc_cpu=prefill_query_start_loc.cpu(),
             seq_lens=prefill_seq_lens,
@@ -5938,47 +5864,28 @@ class GPUModelRunner(
             causal=True,
         )
 
-        # Build per-layer attention metadata for ALL KV cache groups.
-        # Each group may have different attention layers but shares the same
-        # block table and slot mapping (uniform page size, same block pool).
-        # We use copy(cm_base) per group, matching the normal execute_model
-        # path, because builders may mutate the CommonAttentionMetadata.
+        # Build per-layer attention metadata
         prefill_attn_metadata = {}
-        prefill_slot_by_layer = {}
-        for kv_cache_gid in range(num_kv_groups):
-            cm = copy(prefill_cm_base)
-            for attn_group in self.attn_groups[kv_cache_gid]:
-                builder = attn_group.get_metadata_builder(0)
-                layer_meta = builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=cm,
-                    fast_build=True,
-                )
-                for layer_name in attn_group.layer_names:
-                    prefill_attn_metadata[layer_name] = layer_meta
-            for ln in kv_cache_groups[kv_cache_gid].layer_names:
-                prefill_slot_by_layer[ln] = prefill_slot_mapping
+        for attn_group in self.attn_groups[0]:
+            builder = attn_group.get_metadata_builder(0)
+            layer_meta = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=prefill_cm,
+            )
+            for layer_name in attn_group.layer_names:
+                prefill_attn_metadata[layer_name] = layer_meta
 
-        # DEBUG: verify all layers have metadata and slot mappings
-        _log.warning(
-            "BEAM_SEARCH_DEBUG prefill: attn_metadata_layers=%d, "
-            "slot_by_layer_layers=%d, "
-            "attn_groups_per_kv_group=%s",
-            len(prefill_attn_metadata),
-            len(prefill_slot_by_layer),
-            [len(self.attn_groups[gid]) for gid in range(num_kv_groups)],
-        )
+        # Build slot_mapping dict keyed by layer name
+        prefill_slot_by_layer = {
+            ln: prefill_slot_mapping for ln in kv_cache_group.layer_names
+        }
 
         # Run prefill forward pass
-        import os
-
-        os.environ["_BEAM_SEARCH_FA_DEBUG"] = "1"
         with set_forward_context(
             prefill_attn_metadata,
             self.vllm_config,
             num_tokens=prompt_len,
             slot_mapping=prefill_slot_by_layer,
-            skip_compiled=True,
         ):
             hidden_states = self._model_forward(
                 input_ids=input_ids_prefill,
@@ -5992,31 +5899,7 @@ class GPUModelRunner(
             last_hidden = hidden_states[-1:]
         logits = self.model.compute_logits(last_hidden)  # [1, vocab]
 
-        # DEBUG: Log prefill logits for diagnosis
-        import logging
-
-        _log = logging.getLogger(__name__)
-        top5_vals, top5_ids = torch.topk(logits[0], 5)
-        _log.warning(
-            "BEAM_SEARCH_DEBUG prefill logits top5: ids=%s vals=%s",
-            top5_ids.cpu().tolist(),
-            top5_vals.cpu().tolist(),
-        )
-
         # --- Block 2: Initialize beams from prefill logits ---
-        # DEBUG: Check KV cache integrity after prefill
-        kv0_prefill = self.kv_caches[0]
-        kv_at_0_after_prefill = kv0_prefill[
-            0, 0, 0, 0, :4
-        ].clone()  # K[block0, offset0, head0, :4]
-        kv_at_4_after_prefill = kv0_prefill[
-            0, 0, 4, 0, :4
-        ].clone()  # K[block0, offset4, head0, :4]
-        _log.warning(
-            "BEAM_SEARCH_DEBUG after prefill: K[blk0,off0]=%s K[blk0,off4]=%s",
-            kv_at_0_after_prefill.cpu().tolist(),
-            kv_at_4_after_prefill.cpu().tolist(),
-        )
         logprobs = torch.log_softmax(logits.float(), dim=-1)  # [1, V]
         topk_logprobs, topk_indices = torch.topk(
             logprobs[0], beam_width
@@ -6028,41 +5911,10 @@ class GPUModelRunner(
         state.num_active = beam_width
 
         # --- Block 3: Expand block table for all beams ---
-        # The last prompt block may also hold generation tokens (when
-        # prompt_len is not a multiple of block_size). Each beam needs
-        # its own copy of this block to avoid write conflicts.
-        last_prompt_block_idx = num_prompt_blocks - 1
-        prompt_ends_mid_block = (prompt_len % block_size) != 0
-
+        # Allocate generation blocks for beams 1..beam_width-1
         for b in range(1, beam_width):
-            # Copy prompt block IDs (all blocks except possibly the last)
-            beam_bt_np[b, :num_prompt_blocks] = prompt_block_ids
-
-            if prompt_ends_mid_block:
-                # The last prompt block will also hold generation tokens.
-                # Give each beam its own copy of this block.
-                new_last_blk = spare_blocks.popleft()
-                beam_bt_np[b, last_prompt_block_idx] = new_last_blk
-
-                # Copy the KV data from beam 0's last prompt block
-                # to this beam's new block.
-                block_mapping = torch.tensor(
-                    [[prompt_block_ids[last_prompt_block_idx], new_last_blk]],
-                    dtype=torch.int64,
-                )
-                for kv_cache in self.kv_caches:
-                    if kv_cache.dim() >= 2 and kv_cache.shape[0] == 2:
-                        k_cache = kv_cache[0]
-                        v_cache = kv_cache[1]
-                        blk_bytes = k_cache.element_size() * k_cache.stride(0)
-                        ops.swap_blocks(k_cache, k_cache, blk_bytes, block_mapping)
-                        ops.swap_blocks(v_cache, v_cache, blk_bytes, block_mapping)
-                    else:
-                        blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
-                        ops.swap_blocks(kv_cache, kv_cache, blk_bytes, block_mapping)
-
-            # Allocate a generation block for this beam
             gen_block = spare_blocks.popleft()
+            beam_bt_np[b, :num_prompt_blocks] = prompt_block_ids
             beam_bt_np[b, num_prompt_blocks] = gen_block
 
         # Beam 0 already has its gen block from above
@@ -6070,7 +5922,6 @@ class GPUModelRunner(
 
         # --- Block 4-5: Main decode loop ---
         num_active = beam_width
-        last_step = 0
 
         for step in range(max_tokens):
             if num_active == 0:
@@ -6080,26 +5931,10 @@ class GPUModelRunner(
             seq_len_after = token_col + 1
 
             # 4a. Build input tensors
-            # DEBUG: Check KV cache integrity before decode step 0
-            if step == 0:
-                kv0_decode = self.kv_caches[0]
-                kv_at_0_before_decode = kv0_decode[0, 0, 0, 0, :4].clone()
-                kv_at_4_before_decode = kv0_decode[0, 0, 4, 0, :4].clone()
-                _log.warning(
-                    "BEAM_SEARCH_DEBUG before decode step 0: "
-                    "K[blk0,off0]=%s K[blk0,off4]=%s "
-                    "unchanged_0=%s unchanged_4=%s",
-                    kv_at_0_before_decode.cpu().tolist(),
-                    kv_at_4_before_decode.cpu().tolist(),
-                    torch.equal(kv_at_0_after_prefill, kv_at_0_before_decode),
-                    torch.equal(kv_at_4_after_prefill, kv_at_4_before_decode),
-                )
-            # Write decode input data into persistent buffers
-            decode_token_ids = state.token_ids[:num_active, token_col].to(torch.int32)
-            self.input_ids.gpu[:num_active].copy_(decode_token_ids)
-            self.positions.gpu[:num_active].fill_(token_col)
-            input_ids = self.input_ids.gpu[:num_active]
-            positions = self.positions.gpu[:num_active]
+            input_ids = state.token_ids[:num_active, token_col].contiguous()
+            positions = torch.full(
+                (num_active,), token_col, dtype=torch.long, device=device
+            )
 
             # 4b. Compute slot mapping
             block_idx = token_col // block_size
@@ -6116,14 +5951,11 @@ class GPUModelRunner(
             )
             query_start_loc = torch.arange(
                 num_active + 1,
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=device,
             )
 
-            # Base CommonAttentionMetadata for decode step.
-            # Shared across all KV cache groups (block table and slot mapping
-            # are the same since all groups use the same block pool).
-            decode_cm_base = CommonAttentionMetadata(
+            decode_cm = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc.cpu(),
                 seq_lens=attn_seq_lens,
@@ -6142,58 +5974,24 @@ class GPUModelRunner(
                 causal=True,
             )
 
-            # Build per-layer attention metadata for ALL KV cache groups.
             decode_attn_metadata = {}
-            slot_by_layer = {}
-            for kv_cache_gid in range(num_kv_groups):
-                cm = copy(decode_cm_base)
-                for attn_group in self.attn_groups[kv_cache_gid]:
-                    builder = attn_group.get_metadata_builder(0)
-                    layer_meta = builder.build(
-                        common_prefix_len=0,
-                        common_attn_metadata=cm,
-                        fast_build=True,
-                    )
-                    # DEBUG: check scheduler_metadata on first step
-                    if step == 0 and kv_cache_gid == 0:
-                        sm = getattr(layer_meta, "scheduler_metadata", "N/A")
-                        _log.warning(
-                            "BEAM_SEARCH_DEBUG step=0 gid=0 "
-                            "scheduler_metadata=%s type=%s",
-                            sm if sm is None else f"tensor shape={sm.shape}",
-                            type(sm).__name__,
-                        )
-                    for layer_name in attn_group.layer_names:
-                        decode_attn_metadata[layer_name] = layer_meta
-                for ln in kv_cache_groups[kv_cache_gid].layer_names:
-                    slot_by_layer[ln] = slot_mapping
+            for attn_group in self.attn_groups[0]:
+                builder = attn_group.get_metadata_builder(0)
+                layer_meta = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=decode_cm,
+                )
+                for layer_name in attn_group.layer_names:
+                    decode_attn_metadata[layer_name] = layer_meta
+
+            slot_by_layer = {ln: slot_mapping for ln in kv_cache_group.layer_names}
 
             # 4d. Forward pass
-            # DEBUG: Check KV cache before and after forward for step 0-1
-            if step < 2:
-                kv0 = self.kv_caches[0]  # first layer's KV cache
-                slot0 = slot_mapping[0].item()
-                blk_id = slot0 // block_size
-                blk_off = slot0 % block_size
-                kv_before = kv0[
-                    0, blk_id, blk_off, 0, :4
-                ].clone()  # K cache, first 4 values
-                _log.warning(
-                    "BEAM_SEARCH_DEBUG step=%d KV BEFORE forward: "
-                    "slot=%d (blk=%d off=%d) K[:4]=%s",
-                    step,
-                    slot0,
-                    blk_id,
-                    blk_off,
-                    kv_before.cpu().tolist(),
-                )
-
             with set_forward_context(
                 decode_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_active,
                 slot_mapping=slot_by_layer,
-                skip_compiled=True,
             ):
                 hidden_states = self._model_forward(
                     input_ids=input_ids,
@@ -6201,40 +5999,6 @@ class GPUModelRunner(
                 )
 
             logits = self.model.compute_logits(hidden_states)  # [num_active, V]
-
-            # DEBUG: Check KV cache after forward for step 0-1
-            if step < 2:
-                kv0 = self.kv_caches[0]
-                slot0 = slot_mapping[0].item()
-                blk_id = slot0 // block_size
-                blk_off = slot0 % block_size
-                kv_after = kv0[0, blk_id, blk_off, 0, :4].clone()
-                _log.warning(
-                    "BEAM_SEARCH_DEBUG step=%d KV AFTER forward: "
-                    "slot=%d (blk=%d off=%d) K[:4]=%s changed=%s",
-                    step,
-                    slot0,
-                    blk_id,
-                    blk_off,
-                    kv_after.cpu().tolist(),
-                    not torch.equal(kv_before, kv_after),
-                )
-
-            # DEBUG: Log first few decode steps
-            if step < 5:
-                top5_vals, top5_ids = torch.topk(logits[0], 5)
-                _log.warning(
-                    "BEAM_SEARCH_DEBUG decode step=%d beam=0: "
-                    "input_id=%d pos=%d slot=%s bt_row0=%s "
-                    "logits top5: ids=%s vals=%s",
-                    step,
-                    input_ids[0].item(),
-                    token_col,
-                    slot_mapping[: min(4, num_active)].cpu().tolist(),
-                    beam_bt_gpu[0, : num_prompt_blocks + 3].cpu().tolist(),
-                    top5_ids.cpu().tolist(),
-                    [f"{v:.2f}" for v in top5_vals.cpu().tolist()],
-                )
 
             # 5a. GPU beam selection
             parent_indices, cand_tokens, cand_logprobs = gpu_beam_select(
@@ -6274,7 +6038,6 @@ class GPUModelRunner(
 
             new_num_active = len(active_parents)
             if new_num_active == 0:
-                num_active = 0
                 break
 
             # 5c. Write new tokens + update cumulative logprobs
@@ -6297,65 +6060,50 @@ class GPUModelRunner(
 
             # Reorder token history based on parent indices
             new_token_ids = state.token_ids[parent_tensor]
-            # Only write next token if there's room (not the last step)
-            if next_col < state.token_ids.shape[1]:
-                new_token_ids[:new_num_active, next_col] = new_tokens_t
+            new_token_ids[:new_num_active, next_col] = new_tokens_t
             state.token_ids[:new_num_active] = new_token_ids[:new_num_active]
             state.cum_logprobs[:new_num_active] = new_logprobs_t
 
             # 5d. KV cache block table reindexing
-            # Skip if this is the last step (no next forward pass)
-            if next_col >= state.token_ids.shape[1]:
-                num_active = new_num_active
-                last_step = step
-                break
-
             old_bt = beam_bt_np[:num_active].copy()
             new_bt = old_bt[active_parents]
 
             next_block_idx = next_col // block_size
             next_block_offset = next_col % block_size
-            copy_pairs: list[tuple[int, int]] = []
 
-            # CoW: deduplicate ALL blocks from prompt through next_block_idx.
-            # After beam reindexing, multiple beams may share blocks that
-            # contain different KV data (written in previous steps). We must
-            # give each beam its own copy of any shared block that has been
-            # or will be written to.
-            for blk_idx in range(next_block_idx + 1):
-                current_blocks = new_bt[:new_num_active, blk_idx].tolist()
+            if next_block_offset > 0:
+                # Mid-block: check for write conflicts
+                current_blocks = new_bt[:, next_block_idx].tolist()
                 seen: dict[int, int] = {}
+                copy_pairs: list[tuple[int, int]] = []
+
                 for i in range(new_num_active):
                     blk = current_blocks[i]
                     if blk in seen:
                         new_blk = spare_blocks.popleft()
                         copy_pairs.append((blk, new_blk))
-                        new_bt[i, blk_idx] = new_blk
+                        new_bt[i, next_block_idx] = new_blk
                     else:
                         seen[blk] = i
 
-            # At block boundary (next_block_offset == 0), also allocate
-            # fresh blocks at next_block_idx for each beam
-            if next_block_offset == 0:
+                if copy_pairs:
+                    block_mapping = torch.tensor(
+                        copy_pairs,
+                        dtype=torch.int64,
+                    )
+                    for kv_cache in self.kv_caches:
+                        blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
+                        ops.swap_blocks(
+                            kv_cache,
+                            kv_cache,
+                            blk_bytes,
+                            block_mapping,
+                        )
+            else:
+                # At block boundary: allocate fresh blocks
                 for i in range(new_num_active):
                     new_blk = spare_blocks.popleft()
                     new_bt[i, next_block_idx] = new_blk
-
-            if copy_pairs:
-                block_mapping = torch.tensor(
-                    copy_pairs,
-                    dtype=torch.int64,
-                )
-                for kv_cache in self.kv_caches:
-                    if kv_cache.dim() >= 2 and kv_cache.shape[0] == 2:
-                        k_cache = kv_cache[0]
-                        v_cache = kv_cache[1]
-                        blk_bytes = k_cache.element_size() * k_cache.stride(0)
-                        ops.swap_blocks(k_cache, k_cache, blk_bytes, block_mapping)
-                        ops.swap_blocks(v_cache, v_cache, blk_bytes, block_mapping)
-                    else:
-                        blk_bytes = kv_cache.element_size() * kv_cache.stride(0)
-                        ops.swap_blocks(kv_cache, kv_cache, blk_bytes, block_mapping)
 
             beam_bt_np[:new_num_active] = new_bt[:new_num_active]
             beam_bt_gpu[:new_num_active] = torch.from_numpy(new_bt[:new_num_active]).to(
@@ -6363,11 +6111,10 @@ class GPUModelRunner(
             )
 
             num_active = new_num_active
-            last_step = step
 
         # --- Block 6: Collect results ---
         # Add remaining active beams
-        final_col = prompt_len + last_step + 1
+        final_col = prompt_len + min(step + 1, max_tokens)
         for b in range(num_active):
             seq = state.token_ids[b, :final_col].cpu().tolist()
             state.completed.append(

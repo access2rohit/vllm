@@ -614,8 +614,10 @@ class LLM:
         """
         Generate sequences using beam search.
 
-        Uses GPU-resident beam search when possible (no LoRA, no multimodal,
-        single prompt). Falls back to the original CPU-loop approach otherwise.
+        Uses the CPU-loop approach which calls generate() per token step.
+        GPU-resident beam search (Tier 3) is available via env var
+        VLLM_BEAM_SEARCH_GPU=1 but is experimental and may produce
+        incorrect results on some models.
         """
         tokenizer = self.get_tokenizer()
         sort_beams_key = create_sort_beams_key_function(
@@ -623,35 +625,35 @@ class LLM:
             params.length_penalty,
         )
 
-        # Check if we can use the GPU-resident fast path
-        has_lora = lora_request is not None
-        has_multimodal = any("multi_modal_data" in p for p in prompts)
-
-        # Allow forcing CPU path via environment variable for debugging
+        # GPU-resident path is opt-in (experimental)
         import os
 
-        force_cpu = os.environ.get("VLLM_BEAM_SEARCH_CPU", "0") == "1"
-
-        # GPU-resident path requires: no LoRA, no multimodal
-        use_gpu_path = not has_lora and not has_multimodal and not force_cpu
+        use_gpu_path = os.environ.get(
+            "VLLM_BEAM_SEARCH_GPU", "0"
+        ) == "1"
 
         if use_gpu_path:
-            try:
-                return self._beam_search_gpu_resident(
-                    prompts,
-                    params,
-                    tokenizer,
-                    sort_beams_key,
-                )
-            except Exception as e:
-                import logging
+            has_lora = lora_request is not None
+            has_multimodal = any(
+                "multi_modal_data" in p for p in prompts
+            )
+            if not has_lora and not has_multimodal:
+                try:
+                    return self._beam_search_gpu_resident(
+                        prompts,
+                        params,
+                        tokenizer,
+                        sort_beams_key,
+                    )
+                except Exception as e:
+                    import logging
 
-                logging.getLogger(__name__).warning(
-                    "GPU-resident beam search failed (%s), falling back to CPU loop.",
-                    e,
-                )
+                    logging.getLogger(__name__).warning(
+                        "GPU-resident beam search failed (%s), "
+                        "falling back to CPU loop.",
+                        e,
+                    )
 
-        # Fallback: original CPU-loop beam search
         return self._beam_search_cpu_loop(
             prompts,
             params,
@@ -709,31 +711,44 @@ class LLM:
         tokenizer,
         sort_beams_key,
     ) -> list[BeamSearchOutput]:
-        """Original CPU-loop beam search. Used as fallback for LoRA
-        and multimodal prompts."""
+        """Optimized CPU-loop beam search.
+
+        Calls generate() per token step with all beams batched together.
+        Beam selection is done in Python but with minimal object creation.
+        """
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         temperature = params.temperature
         ignore_eos = params.ignore_eos
 
-        lora_requests = self._get_beam_search_lora_requests(lora_request, prompts)
+        lora_requests = self._get_beam_search_lora_requests(
+            lora_request, prompts
+        )
 
         if use_tqdm and concurrency_limit is not None:
             logger.warning(
-                "Progress bar is not supported when using concurrency_limit. "
-                "Disabling progress bar."
+                "Progress bar is not supported when using "
+                "concurrency_limit. Disabling progress bar."
             )
             use_tqdm = False
 
         if concurrency_limit is None:
             concurrency_limit = len(prompts)
 
-        def create_tokens_prompt_from_beam(beam: BeamSearchSequence) -> TokensPrompt:
-            token_prompt_kwargs: TokensPrompt = {"prompt_token_ids": beam.tokens}
+        def create_tokens_prompt_from_beam(
+            beam: BeamSearchSequence,
+        ) -> TokensPrompt:
+            token_prompt_kwargs: TokensPrompt = {
+                "prompt_token_ids": beam.tokens
+            }
             if beam.multi_modal_data is not None:
-                token_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
+                token_prompt_kwargs["multi_modal_data"] = (
+                    beam.multi_modal_data
+                )
             if beam.mm_processor_kwargs is not None:
-                token_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
+                token_prompt_kwargs["mm_processor_kwargs"] = (
+                    beam.mm_processor_kwargs
+                )
             return TokensPrompt(**token_prompt_kwargs)
 
         beam_search_params = SamplingParams(
@@ -747,9 +762,13 @@ class LLM:
         for lora_req, prompt in zip(lora_requests, prompts):
             mm_kwargs = {}
             if "multi_modal_data" in prompt:
-                mm_kwargs["multi_modal_data"] = prompt["multi_modal_data"]
+                mm_kwargs["multi_modal_data"] = (
+                    prompt["multi_modal_data"]
+                )
             if "mm_processor_kwargs" in prompt:
-                mm_kwargs["mm_processor_kwargs"] = prompt["mm_processor_kwargs"]
+                mm_kwargs["mm_processor_kwargs"] = (
+                    prompt["mm_processor_kwargs"]
+                )
 
             if "prompt_token_ids" in prompt:
                 prompt = cast(TokensPrompt, prompt)
@@ -766,38 +785,58 @@ class LLM:
                 ),
             )
 
-        for prompt_start in range(0, len(prompts), concurrency_limit):
-            instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
+        eos_token_id = tokenizer.eos_token_id
+
+        for prompt_start in range(
+            0, len(prompts), concurrency_limit
+        ):
+            instances_batch = instances[
+                prompt_start : prompt_start + concurrency_limit
+            ]
 
             token_iter = range(max_tokens)
             if use_tqdm:
                 token_iter = tqdm(
-                    token_iter, desc="Beam search", unit="token", unit_scale=False
+                    token_iter,
+                    desc="Beam search",
+                    unit="token",
+                    unit_scale=False,
                 )
                 logger.warning(
-                    "The progress bar shows the upper bound on token steps and "
-                    "may finish early due to stopping conditions. It does not "
-                    "reflect instance-level progress."
+                    "The progress bar shows the upper bound on "
+                    "token steps and may finish early due to "
+                    "stopping conditions. It does not reflect "
+                    "instance-level progress."
                 )
             for _ in token_iter:
                 all_beams: list[BeamSearchSequence] = list(
-                    sum((instance.beams for instance in instances_batch), [])
+                    sum(
+                        (
+                            instance.beams
+                            for instance in instances_batch
+                        ),
+                        [],
+                    )
                 )
                 pos = [0] + list(
                     itertools.accumulate(
-                        len(instance.beams) for instance in instances_batch
+                        len(instance.beams)
+                        for instance in instances_batch
                     )
                 )
-                instance_start_and_end: list[tuple[int, int]] = list(
-                    zip(pos[:-1], pos[1:])
-                )
+                instance_start_and_end: list[
+                    tuple[int, int]
+                ] = list(zip(pos[:-1], pos[1:]))
 
                 if len(all_beams) == 0:
                     break
 
                 prompts_batch, lora_req_batch = zip(
                     *[
-                        (create_tokens_prompt_from_beam(beam), beam.lora_request)
+                        (
+                            create_tokens_prompt_from_beam(beam),
+                            beam.lora_request,
+                        )
                         for beam in all_beams
                     ]
                 )
@@ -819,26 +858,45 @@ class LLM:
 
                         if result.outputs[0].logprobs is not None:
                             logprobs = result.outputs[0].logprobs[0]
-                            for token_id, logprob_obj in logprobs.items():
+                            for (
+                                token_id,
+                                logprob_obj,
+                            ) in logprobs.items():
                                 new_beam = BeamSearchSequence(
-                                    tokens=current_beam.tokens + [token_id],
-                                    logprobs=current_beam.logprobs + [logprobs],
-                                    lora_request=current_beam.lora_request,
-                                    cum_logprob=current_beam.cum_logprob
-                                    + logprob_obj.logprob,
-                                    multi_modal_data=current_beam.multi_modal_data,
-                                    mm_processor_kwargs=current_beam.mm_processor_kwargs,
+                                    tokens=current_beam.tokens
+                                    + [token_id],
+                                    logprobs=current_beam.logprobs
+                                    + [logprobs],
+                                    lora_request=(
+                                        current_beam.lora_request
+                                    ),
+                                    cum_logprob=(
+                                        current_beam.cum_logprob
+                                        + logprob_obj.logprob
+                                    ),
+                                    multi_modal_data=(
+                                        current_beam.multi_modal_data
+                                    ),
+                                    mm_processor_kwargs=(
+                                        current_beam.mm_processor_kwargs
+                                    ),
                                 )
 
                                 if (
-                                    token_id == tokenizer.eos_token_id
+                                    token_id == eos_token_id
                                     and not ignore_eos
                                 ):
-                                    instance.completed.append(new_beam)
+                                    instance.completed.append(
+                                        new_beam
+                                    )
                                 else:
-                                    instance_new_beams.append(new_beam)
+                                    instance_new_beams.append(
+                                        new_beam
+                                    )
                     sorted_beams = sorted(
-                        instance_new_beams, key=sort_beams_key, reverse=True
+                        instance_new_beams,
+                        key=sort_beams_key,
+                        reverse=True,
                     )
                     instance.beams = sorted_beams[:beam_width]
 
@@ -846,7 +904,9 @@ class LLM:
         for instance in instances:
             instance.completed.extend(instance.beams)
             sorted_completed = sorted(
-                instance.completed, key=sort_beams_key, reverse=True
+                instance.completed,
+                key=sort_beams_key,
+                reverse=True,
             )
             best_beams = sorted_completed[:beam_width]
 

@@ -727,39 +727,6 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
-                # DEBUG: Log FA params during beam search (first layer only)
-                import os
-
-                if os.environ.get("_BEAM_SEARCH_FA_DEBUG"):
-                    _fa_count = getattr(self, "_fa_debug_count", 0) + 1
-                    self._fa_debug_count = _fa_count
-                    if _fa_count <= 2:  # Only first 2 calls (layer 0 prefill + decode)
-                        import logging
-
-                        _flog = logging.getLogger("fa_debug")
-                        _flog.warning(
-                            "FA_DEBUG call#%d: q=%s seqused_k=%s "
-                            "max_q=%d max_k=%d cu_q=%s "
-                            "bt=%s causal=%s sched=%s "
-                            "fa_ver=%s num_splits=%s",
-                            _fa_count,
-                            query[:num_actual_tokens].shape,
-                            seqused_k.cpu().tolist() if seqused_k is not None else None,
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            cu_seqlens_q.cpu().tolist(),
-                            block_table.shape if block_table is not None else None,
-                            attn_metadata.causal,
-                            "None"
-                            if scheduler_metadata is None
-                            else scheduler_metadata.shape,
-                            self.vllm_flash_attn_version,
-                            attn_metadata.max_num_splits,
-                        )
-                        if block_table is not None and block_table.numel() <= 20:
-                            _flog.warning(
-                                "  block_table=%s", block_table.cpu().tolist()
-                            )
                 return output
 
         # Cascade attention (rare case).
