@@ -41,9 +41,7 @@ from vllm.utils.tuned_config import (
 
 logger = init_logger(__name__)
 
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), "configs"
-)
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:

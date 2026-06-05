@@ -52,9 +52,7 @@ def test_resolve_returns_first_existing(monkeypatch, tmp_path):
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "f.json").write_text("{}")
-    assert resolve_tuned_config_path("f.json", str(pkg)) == str(
-        pkg / "f.json"
-    )
+    assert resolve_tuned_config_path("f.json", str(pkg)) == str(pkg / "f.json")
 
 
 def test_resolve_env_shadows_packaged(monkeypatch, tmp_path):
@@ -65,9 +63,7 @@ def test_resolve_env_shadows_packaged(monkeypatch, tmp_path):
     (env_dir / "f.json").write_text("{}")
     (pkg / "f.json").write_text("{}")
     monkeypatch.setenv(ENV, str(env_dir))
-    assert resolve_tuned_config_path("f.json", str(pkg)) == str(
-        env_dir / "f.json"
-    )
+    assert resolve_tuned_config_path("f.json", str(pkg)) == str(env_dir / "f.json")
 
 
 def test_resolve_env_miss_falls_back_to_packaged(monkeypatch, tmp_path):
@@ -77,9 +73,7 @@ def test_resolve_env_miss_falls_back_to_packaged(monkeypatch, tmp_path):
     pkg.mkdir()
     (pkg / "f.json").write_text("{}")
     monkeypatch.setenv(ENV, str(env_dir))
-    assert resolve_tuned_config_path("f.json", str(pkg)) == str(
-        pkg / "f.json"
-    )
+    assert resolve_tuned_config_path("f.json", str(pkg)) == str(pkg / "f.json")
 
 
 def test_resolve_none_when_nothing_exists(monkeypatch, tmp_path):
@@ -100,9 +94,7 @@ def test_load_dict_returns_int_keyed_config(monkeypatch, tmp_path):
     assert all(isinstance(k, int) for k in out)
 
 
-def test_load_pops_triton_version_and_filters_non_digit(
-    monkeypatch, tmp_path
-):
+def test_load_pops_triton_version_and_filters_non_digit(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV, raising=False)
     (tmp_path / "f.json").write_text(
         json.dumps(

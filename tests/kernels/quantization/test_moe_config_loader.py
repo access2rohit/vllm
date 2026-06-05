@@ -48,9 +48,7 @@ def test_moe_packaged_path_loads(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV, raising=False)
     _write(tmp_path, _moe_file_name(), {"1": SENTINEL[1]})
     monkeypatch.setattr(fused_moe, "_CONFIGS_DIR", str(tmp_path))
-    assert fused_moe.get_moe_configs(E, N, DTYPE, BLOCK_N, BLOCK_K) == (
-        SENTINEL
-    )
+    assert fused_moe.get_moe_configs(E, N, DTYPE, BLOCK_N, BLOCK_K) == (SENTINEL)
 
 
 def test_moe_env_override(monkeypatch, tmp_path):

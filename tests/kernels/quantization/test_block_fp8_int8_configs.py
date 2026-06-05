@@ -80,9 +80,7 @@ def test_fp8_packaged_path_loads(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV, raising=False)
     _write(tmp_path, _fp8_file_name(), {"1": SENTINEL[1]})
     monkeypatch.setattr(fp8_utils, "_CONFIGS_DIR", str(tmp_path))
-    assert fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) == (
-        SENTINEL
-    )
+    assert fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) == (SENTINEL)
 
 
 def test_fp8_env_override(monkeypatch, tmp_path):
@@ -107,9 +105,7 @@ def test_fp8_env_miss_falls_back_to_packaged(monkeypatch, tmp_path):
     _write(pkg, _fp8_file_name(), {"1": SENTINEL[1]})
     monkeypatch.setenv(ENV, str(env_dir))
     monkeypatch.setattr(fp8_utils, "_CONFIGS_DIR", str(pkg))
-    assert fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) == (
-        SENTINEL
-    )
+    assert fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) == (SENTINEL)
 
 
 def test_fp8_both_miss_returns_none(monkeypatch, tmp_path):
@@ -119,18 +115,14 @@ def test_fp8_both_miss_returns_none(monkeypatch, tmp_path):
     pkg.mkdir()
     monkeypatch.setenv(ENV, str(env_dir))
     monkeypatch.setattr(fp8_utils, "_CONFIGS_DIR", str(pkg))
-    assert (
-        fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) is None
-    )
+    assert fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) is None
 
 
 def test_fp8_non_dict_returns_none(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV, raising=False)
     (tmp_path / _fp8_file_name()).write_text(json.dumps([1, 2, 3]))
     monkeypatch.setattr(fp8_utils, "_CONFIGS_DIR", str(tmp_path))
-    assert (
-        fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) is None
-    )
+    assert fp8_utils.get_w8a8_block_fp8_configs(N, K, BLOCK_N, BLOCK_K) is None
 
 
 # =============================== INT8 =====================================
@@ -144,9 +136,7 @@ def test_int8_packaged_path_loads(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV, raising=False)
     _write(tmp_path, _int8_file_name(), {"1": SENTINEL[1]})
     monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(tmp_path))
-    assert int8_utils.get_w8a8_block_int8_configs(
-        N, K, BLOCK_N, BLOCK_K
-    ) == SENTINEL
+    assert int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K) == SENTINEL
 
 
 def test_int8_env_override(monkeypatch, tmp_path):
@@ -158,9 +148,9 @@ def test_int8_env_override(monkeypatch, tmp_path):
     _write(pkg, _int8_file_name(), {"1": {"src": "pkg"}})
     monkeypatch.setenv(ENV, str(env_dir))
     monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(pkg))
-    assert int8_utils.get_w8a8_block_int8_configs(
-        N, K, BLOCK_N, BLOCK_K
-    ) == {1: {"src": "env"}}
+    assert int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K) == {
+        1: {"src": "env"}
+    }
 
 
 def test_int8_env_miss_falls_back_to_packaged(monkeypatch, tmp_path):
@@ -171,9 +161,7 @@ def test_int8_env_miss_falls_back_to_packaged(monkeypatch, tmp_path):
     _write(pkg, _int8_file_name(), {"1": SENTINEL[1]})
     monkeypatch.setenv(ENV, str(env_dir))
     monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(pkg))
-    assert int8_utils.get_w8a8_block_int8_configs(
-        N, K, BLOCK_N, BLOCK_K
-    ) == SENTINEL
+    assert int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K) == SENTINEL
 
 
 def test_int8_both_miss_returns_none(monkeypatch, tmp_path):
@@ -183,17 +171,11 @@ def test_int8_both_miss_returns_none(monkeypatch, tmp_path):
     pkg.mkdir()
     monkeypatch.setenv(ENV, str(env_dir))
     monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(pkg))
-    assert (
-        int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K)
-        is None
-    )
+    assert int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K) is None
 
 
 def test_int8_non_dict_returns_none(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV, raising=False)
     (tmp_path / _int8_file_name()).write_text(json.dumps([1, 2, 3]))
     monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(tmp_path))
-    assert (
-        int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K)
-        is None
-    )
+    assert int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K) is None

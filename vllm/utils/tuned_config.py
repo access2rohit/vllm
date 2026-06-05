@@ -17,9 +17,7 @@ from typing import Any
 import vllm.envs as envs
 
 
-def tuned_config_search_paths(
-    file_name: str, packaged_dir: str | None
-) -> list[str]:
+def tuned_config_search_paths(file_name: str, packaged_dir: str | None) -> list[str]:
     """Ordered candidate paths for ``file_name``: the user override folder
     (``VLLM_TUNED_CONFIG_FOLDER``) first if set, then ``packaged_dir`` if not
     None. Pure string joins -- no filesystem access."""
@@ -32,9 +30,7 @@ def tuned_config_search_paths(
     return paths
 
 
-def resolve_tuned_config_path(
-    file_name: str, packaged_dir: str | None
-) -> str | None:
+def resolve_tuned_config_path(file_name: str, packaged_dir: str | None) -> str | None:
     """First search path that exists on disk, else None."""
     for path in tuned_config_search_paths(file_name, packaged_dir):
         if os.path.exists(path):

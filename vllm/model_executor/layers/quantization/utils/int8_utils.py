@@ -19,9 +19,7 @@ from vllm.utils.tuned_config import (
 
 logger = logging.getLogger(__name__)
 
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), "configs"
-)
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
 
 def apply_w8a8_block_int8_linear(

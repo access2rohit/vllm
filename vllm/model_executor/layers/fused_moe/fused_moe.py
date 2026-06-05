@@ -1015,9 +1015,7 @@ def get_config_file_name(
 
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), "configs"
-)
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
 
 @functools.lru_cache
