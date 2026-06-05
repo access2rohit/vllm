@@ -5,7 +5,6 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
 import functools
-import json
 import os
 from contextlib import contextmanager
 from typing import Any
@@ -13,12 +12,16 @@ from typing import Any
 import torch
 from packaging import version
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.tuned_config import (
+    load_tuned_config,
+    resolve_tuned_config_path,
+    tuned_config_search_paths,
+)
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 if current_platform.is_xpu():
@@ -78,36 +81,19 @@ def get_ssm_configs(
     device_name = get_ssm_device_name()
     json_file_name = get_ssm_config_file_name(headdim, dstate, cache_dtype, device_name)
 
-    config_file_paths: list[str] = []
-
-    # User-supplied override
-    user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
-    if user_defined_config_folder is not None:
-        config_file_paths.append(
-            os.path.join(user_defined_config_folder, json_file_name)
+    config = load_tuned_config(json_file_name, _CONFIGS_DIR)
+    if config is not None:
+        logger.info_once(
+            "Using SSM config from %s for selective_state_update.",
+            resolve_tuned_config_path(json_file_name, _CONFIGS_DIR),
+            scope="global",
         )
-
-    # Bundled default
-    config_file_paths.append(os.path.join(_CONFIGS_DIR, json_file_name))
-
-    for path in config_file_paths:
-        if os.path.exists(path):
-            with open(path) as f:
-                logger.info_once(
-                    "Using SSM config from %s for selective_state_update.",
-                    path,
-                    scope="global",
-                )
-                raw = json.load(f)
-                if isinstance(raw, dict):
-                    # triton_version included in the config file only for reference
-                    raw.pop("triton_version", None)
-                    return {int(k): v for k, v in raw.items() if k.isdigit()}
+        return config
 
     logger.warning_once(
         "Using default Mamba SSU config. Performance might be sub-optimal! "
         "Config file not found at %s",
-        ", ".join(config_file_paths),
+        ", ".join(tuned_config_search_paths(json_file_name, _CONFIGS_DIR)),
     )
     return None
 

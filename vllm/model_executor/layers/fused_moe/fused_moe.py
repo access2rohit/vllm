@@ -3,7 +3,6 @@
 """Fused MoE Triton kernels."""
 
 import functools
-import json
 import os
 from typing import Any
 
@@ -31,6 +30,11 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.tuned_config import (
+    load_tuned_config,
+    resolve_tuned_config_path,
+    tuned_config_search_paths,
+)
 
 logger = init_logger(__name__)
 
@@ -1011,6 +1015,11 @@ def get_config_file_name(
 
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
+_CONFIGS_DIR = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "configs"
+)
+
+
 @functools.lru_cache
 def get_moe_configs(
     E: int,
@@ -1037,41 +1046,21 @@ def get_moe_configs(
     block_shape = [block_n, block_k] if block_n and block_k else None
     json_file_name = get_config_file_name(E, N, dtype, block_shape)
 
-    config_file_paths = []
-
-    # note that we prioritize user defined config
-    user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
-    if user_defined_config_folder is not None:
-        user_defined_config_file_path = os.path.join(
-            user_defined_config_folder, json_file_name
+    config = load_tuned_config(json_file_name, _CONFIGS_DIR)
+    if config is not None:
+        logger.info_once(
+            "Using configuration from %s for MoE layer.",
+            resolve_tuned_config_path(json_file_name, _CONFIGS_DIR),
+            scope="global",
         )
-        config_file_paths.append(user_defined_config_file_path)
-
-    default_config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    config_file_paths.append(default_config_file_path)
-
-    for config_file_path in config_file_paths:
-        if os.path.exists(config_file_path):
-            with open(config_file_path) as f:
-                logger.info_once(
-                    "Using configuration from %s for MoE layer.",
-                    config_file_path,
-                    scope="global",
-                )
-                # If a configuration has been found, return it
-                tuned_config = json.load(f)
-                # Delete triton_version from tuned_config
-                tuned_config.pop("triton_version", None)
-                return {int(key): val for key, val in tuned_config.items()}
+        return config
 
     # If no optimized configuration is available, we will use the default
     # configuration
     logger.warning_once(
         "Using default MoE config. Performance might be sub-optimal! "
         "Config file not found at %s",
-        ", ".join(config_file_paths),
+        ", ".join(tuned_config_search_paths(json_file_name, _CONFIGS_DIR)),
     )
     return None
 
