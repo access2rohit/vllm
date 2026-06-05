@@ -3,7 +3,6 @@
 
 # Adapted from https://github.com/sgl-project/sglang/pull/2575
 import functools
-import json
 import os
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -34,8 +33,17 @@ from vllm.utils.deep_gemm import (
     transform_sf_into_required_layout,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.tuned_config import (
+    load_tuned_config,
+    resolve_tuned_config_path,
+    tuned_config_search_paths,
+)
 
 logger = init_logger(__name__)
+
+_CONFIGS_DIR = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "configs"
+)
 
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
@@ -811,24 +819,20 @@ def get_w8a8_block_fp8_configs(
     device_name = current_platform.get_device_name().replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n},{block_k}].json"  # noqa: E501
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info(
-                "Using configuration from %s for W8A8 Block FP8 kernel.",
-                config_file_path,
-            )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
+    config = load_tuned_config(json_file_name, _CONFIGS_DIR)
+    if config is not None:
+        logger.info(
+            "Using configuration from %s for W8A8 Block FP8 kernel.",
+            resolve_tuned_config_path(json_file_name, _CONFIGS_DIR),
+        )
+        return config
 
     # If no optimized configuration is available, we will use the default
     # configuration
     logger.warning(
         "Using default W8A8 Block FP8 kernel config. Performance might "
         "be sub-optimal! Config file not found at %s",
-        config_file_path,
+        ", ".join(tuned_config_search_paths(json_file_name, _CONFIGS_DIR)),
     )
     return None
 
