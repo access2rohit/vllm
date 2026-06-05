@@ -3,7 +3,6 @@
 
 # Adapted from https://github.com/sgl-project/sglang/blob/4cb53ecd0cffceb6dee5c011a58f65997a86f151/python/sglang/srt/layers/quantization/int8_kernel.py
 import functools
-import json
 import logging
 import os
 from typing import Any
@@ -12,8 +11,17 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.tuned_config import (
+    load_tuned_config,
+    resolve_tuned_config_path,
+    tuned_config_search_paths,
+)
 
 logger = logging.getLogger(__name__)
+
+_CONFIGS_DIR = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "configs"
+)
 
 
 def apply_w8a8_block_int8_linear(
@@ -367,19 +375,15 @@ def get_w8a8_block_int8_configs(
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = current_platform.get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n}, {block_k}].json"  # noqa: E501
+    json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n},{block_k}].json"  # noqa: E501
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info(
-                "Using configuration from %s for W8A8 Block INT8 kernel.",
-                config_file_path,
-            )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
+    config = load_tuned_config(json_file_name, _CONFIGS_DIR)
+    if config is not None:
+        logger.info(
+            "Using configuration from %s for W8A8 Block INT8 kernel.",
+            resolve_tuned_config_path(json_file_name, _CONFIGS_DIR),
+        )
+        return config
 
     # If no optimized configuration is available, we will use the default
     # configuration
@@ -388,7 +392,7 @@ def get_w8a8_block_int8_configs(
             "Using default W8A8 Block INT8 kernel config. Performance might "
             "be sub-optimal! Config file not found at %s"
         ),
-        config_file_path,
+        ", ".join(tuned_config_search_paths(json_file_name, _CONFIGS_DIR)),
     )
     return None
 

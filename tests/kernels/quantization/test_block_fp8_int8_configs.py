@@ -134,5 +134,66 @@ def test_fp8_non_dict_returns_none(monkeypatch, tmp_path):
 
 
 # =============================== INT8 =====================================
-# INT8 tests are added in Phase 3 (alongside the int8_utils wiring + the
-# block_shape filename-space bugfix). Kept in this same file per the RFC.
+
+
+def test_int8_packaged_path_loads(monkeypatch, tmp_path):
+    """PROVES THE BUGFIX: the sentinel is written under the UNSPACED filename
+    (block_shape=[128,128]). The pre-fix loader built "[128, 128]" with a stray
+    space and never matched -- so this test is red before the int8_utils fix and
+    green after. It is also the no-break proof for the packaged read."""
+    monkeypatch.delenv(ENV, raising=False)
+    _write(tmp_path, _int8_file_name(), {"1": SENTINEL[1]})
+    monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(tmp_path))
+    assert int8_utils.get_w8a8_block_int8_configs(
+        N, K, BLOCK_N, BLOCK_K
+    ) == SENTINEL
+
+
+def test_int8_env_override(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    pkg = tmp_path / "pkg"
+    env_dir.mkdir()
+    pkg.mkdir()
+    _write(env_dir, _int8_file_name(), {"1": {"src": "env"}})
+    _write(pkg, _int8_file_name(), {"1": {"src": "pkg"}})
+    monkeypatch.setenv(ENV, str(env_dir))
+    monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(pkg))
+    assert int8_utils.get_w8a8_block_int8_configs(
+        N, K, BLOCK_N, BLOCK_K
+    ) == {1: {"src": "env"}}
+
+
+def test_int8_env_miss_falls_back_to_packaged(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    pkg = tmp_path / "pkg"
+    env_dir.mkdir()
+    pkg.mkdir()
+    _write(pkg, _int8_file_name(), {"1": SENTINEL[1]})
+    monkeypatch.setenv(ENV, str(env_dir))
+    monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(pkg))
+    assert int8_utils.get_w8a8_block_int8_configs(
+        N, K, BLOCK_N, BLOCK_K
+    ) == SENTINEL
+
+
+def test_int8_both_miss_returns_none(monkeypatch, tmp_path):
+    env_dir = tmp_path / "env"
+    pkg = tmp_path / "pkg"
+    env_dir.mkdir()
+    pkg.mkdir()
+    monkeypatch.setenv(ENV, str(env_dir))
+    monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(pkg))
+    assert (
+        int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K)
+        is None
+    )
+
+
+def test_int8_non_dict_returns_none(monkeypatch, tmp_path):
+    monkeypatch.delenv(ENV, raising=False)
+    (tmp_path / _int8_file_name()).write_text(json.dumps([1, 2, 3]))
+    monkeypatch.setattr(int8_utils, "_CONFIGS_DIR", str(tmp_path))
+    assert (
+        int8_utils.get_w8a8_block_int8_configs(N, K, BLOCK_N, BLOCK_K)
+        is None
+    )
