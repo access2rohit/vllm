@@ -80,28 +80,24 @@ _SEED_SPECS = (
         applicability=Applicability.COMPUTE_HEAVY_INPATH,
         key_fn=_moe_key_fn,
         packaged_dir=_moe._CONFIGS_DIR,
-        tuner_script="benchmarks/kernels/benchmark_moe.py",
     ),
     TunableKernelSpec(
         name="w8a8_block_fp8",
         applicability=Applicability.COMPUTE_HEAVY_INPATH,
         key_fn=_fp8_key_fn,
         packaged_dir=_fp8._CONFIGS_DIR,
-        tuner_script="benchmarks/kernels/benchmark_w8a8_block_fp8.py",
     ),
     TunableKernelSpec(
         name="w8a8_block_int8",
         applicability=Applicability.COMPUTE_HEAVY_INPATH,
         key_fn=_int8_key_fn,
         packaged_dir=_int8._CONFIGS_DIR,
-        tuner_script="benchmarks/kernels/benchmark_int8_gemm.py",
     ),
     TunableKernelSpec(
         name="selective_state_update",
         applicability=Applicability.COMPUTE_HEAVY_INPATH,
         key_fn=_ssu_key_fn,
         packaged_dir=_ssm._CONFIGS_DIR,
-        tuner_script="benchmarks/kernels/benchmark_selective_state_update.py",
     ),
 )
 

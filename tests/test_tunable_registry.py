@@ -51,7 +51,6 @@ def test_register_and_get():
         applicability=Applicability.COMPUTE_HEAVY_INPATH,
         key_fn=lambda: "a.json",
         packaged_dir="/pkg/a",
-        tuner_script="benchmarks/kernels/benchmark_a.py",
     )
     # Register out of order; get_tunable_kernels must sort by name.
     register_tunable_kernel(spec_b)
@@ -99,7 +98,6 @@ def test_decorator_builds_and_loads(monkeypatch, tmp_path):
         key_fn=key_fn,
         packaged_dir="/nonexistent/pkg",
         applicability=Applicability.COMPUTE_HEAVY_INPATH,
-        tuner_script="benchmarks/kernels/benchmark_fake.py",
     )
     def get_fake_configs(n, k):  # body is replaced by the decorator
         raise AssertionError("original body must not run")
@@ -174,7 +172,9 @@ def test_real_kernels_registered():
     for name in expected:
         spec = by_name[name]
         assert spec.applicability is Applicability.COMPUTE_HEAVY_INPATH
-        assert spec.tuner_script and spec.tuner_script.endswith(".py")
+        # tuner_script is intentionally absent from the spec (D2): the tuner
+        # linkage lives only in getter docstrings, not in registry metadata.
+        assert not hasattr(spec, "tuner_script")
 
 
 def test_real_kernel_key_fns_produce_valid_filenames():

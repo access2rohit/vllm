@@ -5,8 +5,10 @@
 This module is the single, importable source of truth for "which Triton
 kernels in vLLM expose an offline-tuned-config path, and how." Each tunable
 kernel registers a :class:`TunableKernelSpec` describing its config-filename
-builder (``key_fn``), the packaged config directory, an ``applicability`` tag,
-and (optionally) the tuner script that generates its configs.
+builder (``key_fn``), the packaged config directory, and an ``applicability``
+tag. The linkage to the benchmark/tuner that regenerates a kernel's configs is
+intentionally NOT stored here -- per vLLM convention it lives in the kernel's
+getter docstring.
 
 The registry is populated at import time -- either via the
 :func:`tunable_triton_kernel` decorator placed on a kernel's "configs getter",
@@ -50,15 +52,19 @@ class TunableKernelSpec:
 
     ``key_fn`` maps the kernel's shape/dtype arguments to the JSON config
     filename that :func:`load_tuned_config` searches for. ``packaged_dir`` is
-    the directory shipped with vLLM that holds those configs. ``tuner_script``
-    points at the benchmark script that regenerates the configs (or None).
+    the directory shipped with vLLM that holds those configs.
+
+    NOTE: there is intentionally no field pointing at the tuner/benchmark
+    script that regenerates a kernel's configs. Per vLLM convention that
+    linkage lives in the kernel's getter docstring, not in this metadata, so
+    the registry stays a pure resolve/select mechanism with no build-time
+    coupling to the benchmarks tree.
     """
 
     name: str
     applicability: Applicability
     key_fn: Callable[..., str]
     packaged_dir: str
-    tuner_script: str | None = None
 
 
 # The single source of truth, keyed by kernel name. Populated at import time.
@@ -117,7 +123,6 @@ def tunable_triton_kernel(
     key_fn: Callable[..., str],
     packaged_dir: str,
     applicability: Applicability = Applicability.COMPUTE_HEAVY_INPATH,
-    tuner_script: str | None = None,
 ):
     """Decorator turning a "configs getter" into a tunable kernel front-end.
 
@@ -139,7 +144,6 @@ def tunable_triton_kernel(
         applicability=applicability,
         key_fn=key_fn,
         packaged_dir=packaged_dir,
-        tuner_script=tuner_script,
     )
 
     def decorator(func):
