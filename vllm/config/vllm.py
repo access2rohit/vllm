@@ -1943,6 +1943,24 @@ class VllmConfig:
                         "allreduce-rms fusion will be enabled for all num_tokens."
                     )
 
+        # OP-301: MoE finalize + AR + RMSNorm fusion only applies to compile
+        # ranges fully inside the oneshot allreduce regime (<= 16 tokens).
+        # Without an endpoint at 16, the smallest range (e.g. (1, 73) from the
+        # allreduce-rms fusion sizing) never satisfies range.end <= 16 and the
+        # pass can never fire. Baseline (flag off) is unaffected.
+        if envs.VLLM_MOE_FINALIZE_AR_RMS_FUSION:
+            from vllm.compilation.passes.fusion.moe_finalize_ar_rms_fusion import (
+                MOE_FINALIZE_AR_RMS_MAX_TOKENS,
+            )
+
+            if (
+                compile_range_end is not None
+                and MOE_FINALIZE_AR_RMS_MAX_TOKENS < compile_range_end
+            ):
+                computed_compile_ranges_endpoints.append(
+                    MOE_FINALIZE_AR_RMS_MAX_TOKENS
+                )
+
         # Add the compile ranges for sequence parallelism
         if compilation_config.pass_config.enable_sp:
             pass_config = compilation_config.pass_config

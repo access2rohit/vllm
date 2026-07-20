@@ -33,6 +33,7 @@ from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
@@ -91,6 +92,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
@@ -949,6 +951,125 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
             return super().forward(input_)
 
 
+def _min_latency_q_b_proj_impl(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Dynamically run FlashInfer's tinygemm2 min-latency bf16 GEMM if
+    num_tokens <= 8, otherwise fall back to F.linear (cuBLASLt).
+    This must be wrapped in a custom op because our torch.compile integration
+    does not support runtime dispatching on num_tokens.
+    """
+    num_tokens = input_.shape[0]
+    if 0 < num_tokens <= 8:
+        from flashinfer.gemm import tinygemm_bf16
+
+        output = torch.empty(
+            num_tokens,
+            weight.shape[0],
+            dtype=torch.bfloat16,
+            device=input_.device,
+        )
+        tinygemm_bf16(input_, weight, output)
+        return output
+    else:
+        return torch.nn.functional.linear(input_, weight)
+
+
+def _min_latency_q_b_proj_fake(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return input_.new_empty(input_.shape[0], weight.shape[0])
+
+
+direct_register_custom_op(
+    op_name="min_latency_q_b_proj",
+    op_func=_min_latency_q_b_proj_impl,
+    mutates_args=[],
+    fake_impl=_min_latency_q_b_proj_fake,
+)
+
+
+class DeepSeekV2QBProjLinear(ColumnParallelLinear):
+    """ColumnParallelLinear for the MLA q_b projection that routes through
+    FlashInfer's tinygemm2 min-latency bf16 GEMM (warp-specialized,
+    latency-optimized for 1-8 rows) when num_tokens <= 8, falling back to
+    the standard cuBLASLt path otherwise.
+    """
+
+    # Per-TP-rank shape the tinygemm dispatch was validated on:
+    # K = q_lora_rank = 1536, N = num_local_heads * qk_head_dim = 1536.
+    _TINYGEMM_K = 1536
+    _TINYGEMM_N = 1536
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            input_size,
+            output_size,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+        # Check if the FlashInfer tinygemm2 min-latency GEMM can be used.
+        # It requires an unquantized bf16 row-major weight at the exact
+        # per-rank shape, SM100, and FlashInfer available.
+        self._use_min_latency_gemm = (
+            envs.VLLM_MIN_LATENCY_QB_PROJ
+            and hasattr(self, "weight")
+            and self.weight.dtype == torch.bfloat16
+            and self.weight.shape[0] == self._TINYGEMM_N
+            and self.weight.shape[1] == self._TINYGEMM_K
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+            and has_flashinfer()
+        )
+        if self._use_min_latency_gemm:
+            try:
+                # Pre-build the tinygemm2 JIT module at load time so no JIT
+                # compilation happens during CUDA graph capture. The build
+                # is disk-cached (~/.cache/flashinfer) after the first time.
+                from flashinfer.gemm.routergemm import get_tinygemm2_module
+
+                get_tinygemm2_module()
+            except Exception:
+                logger.warning(
+                    "Failed to build FlashInfer tinygemm2 module; "
+                    "falling back to the standard q_b_proj path.",
+                    exc_info=True,
+                )
+                self._use_min_latency_gemm = False
+        if self._use_min_latency_gemm:
+            logger.info_once(
+                "DeepSeekV2QBProjLinear: min-latency tinygemm dispatch "
+                "ENABLED for q_b_proj (num_tokens<=8 -> FlashInfer tinygemm2)"
+            )
+
+    def forward(
+        self,
+        input_,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.nn.Parameter | None]:
+        if self._use_min_latency_gemm:
+            output = torch.ops.vllm.min_latency_q_b_proj(input_, self.weight)
+            if not self.return_bias:
+                return output
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+        else:
+            # Fallback to the standard forward method when
+            # the tinygemm min-latency kernel cannot be used.
+            return super().forward(input_)
+
+
 class DeepseekV2MLAAttention(nn.Module):
     """
     Main reference: DeepseekV2 paper, and FlashInfer Implementation
@@ -1017,7 +1138,17 @@ class DeepseekV2MLAAttention(nn.Module):
 
         if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            # DeepSeekV2QBProjLinear routes num_tokens <= 8 through
+            # FlashInfer's tinygemm2 min-latency GEMM; it degrades to the
+            # plain ColumnParallelLinear path when its capability/dtype/
+            # shape gates do not match. Constructed only when the env flag
+            # is set so the default path is byte-identical to baseline.
+            q_b_proj_cls = (
+                DeepSeekV2QBProjLinear
+                if envs.VLLM_MIN_LATENCY_QB_PROJ
+                else ColumnParallelLinear
+            )
+            self.q_b_proj = q_b_proj_cls(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,

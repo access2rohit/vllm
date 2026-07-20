@@ -4,6 +4,9 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    consume_aux_stream_quant_stash,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
@@ -20,6 +23,15 @@ def _quantize_input(
     # which use a single kernel call for quant + experts.
     if defer_input_quant:
         return a1, None
+
+    # VLLM_SHARED_STREAM_QUANT_OFFLOAD: adopt the quant already issued on
+    # the shared-experts aux stream, if it was produced from exactly this
+    # tensor (identity check inside; falls through to the baseline quant
+    # otherwise, e.g. when dispatch/padding/router-weight transforms
+    # replaced the tensor).
+    stashed = consume_aux_stream_quant_stash(a1)
+    if stashed is not None:
+        return stashed
 
     input_sf = (
         quant_config.a1_gscale if quant_config.use_nvfp4_w4a4 else quant_config.a1_scale

@@ -195,6 +195,8 @@ if TYPE_CHECKING:
     VLLM_MOE_SKIP_PADDING: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
+    VLLM_MOE_FINALIZE_AR_RMS_FUSION: bool = False
+    VLLM_MIN_LATENCY_QB_PROJ: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
@@ -269,6 +271,8 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_SHARED_STREAM_QUANT_OFFLOAD: bool = False
+    VLLM_SHARED_STREAM_QUANT_OFFLOAD_BS1_DEDICATED: bool = False
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
@@ -1528,6 +1532,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
     ),
+    # OP-301: fuse MoE finalize + shared-expert add + routed scaling +
+    # TP allreduce + residual + RMSNorm into a single MNNVL oneshot Lamport
+    # kernel (SM100, TP in {2,4,8}, bf16, mnnvl allreduce backend). Only
+    # applies to compiled graphs whose compile range fits the oneshot
+    # regime (<= 16 tokens). Default off.
+    "VLLM_MOE_FINALIZE_AR_RMS_FUSION": lambda: bool(
+        int(os.getenv("VLLM_MOE_FINALIZE_AR_RMS_FUSION", "0"))
+    ),
+    # Route the DeepSeek-family MLA q_b projection through FlashInfer's
+    # tinygemm2 min-latency bf16 GEMM when num_tokens <= 8 (falls back to
+    # F.linear otherwise). Requires SM100, bf16 unquantized weights, and
+    # per-rank K == N == 1536. Default off.
+    "VLLM_MIN_LATENCY_QB_PROJ": lambda: bool(
+        int(os.getenv("VLLM_MIN_LATENCY_QB_PROJ", "0"))
+    ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.
@@ -1897,6 +1916,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # Offload the routed-expert activation quantization onto the shared
+    # experts aux stream when shared-expert multi-stream overlap is active
+    # (MULTI_STREAM_OVERLAPPED). The quant runs in the aux stream's slack
+    # ahead of the shared-expert MLP and the main stream adopts the result
+    # via an event wait, removing the serialized quant span between the
+    # router GEMM and the grouped expert GEMM. Only applies to the
+    # no-DP/EP prepare paths; all other paths are unchanged.
+    "VLLM_SHARED_STREAM_QUANT_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_SHARED_STREAM_QUANT_OFFLOAD", "0"))
+    ),
+    # Minimum token count for the aux-stream quant offload above. Below this
+    # the offload is skipped and the baseline main-stream quant runs
+    # unchanged. Rationale: at very small M the quant at the head of the aux
+    # burst delays the shared-expert MLP enough that the aux stream starts
+    # gating the fork/join, regressing E2E; at M >= 8 the aux slack fully
+    # hides it (measured on B200 TP8 Kimi-K2.6-NVFP4). Shape-based branch,
+    # evaluated per captured CUDA graph size — graph-safe.
+    "VLLM_SHARED_STREAM_QUANT_OFFLOAD_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_SHARED_STREAM_QUANT_OFFLOAD_MIN_TOKENS", "8")
+    ),
+    # Below MIN_TOKENS, instead of leaving the routed-activation quant
+    # serialized on the main stream, enqueue it on a DEDICATED side stream
+    # that forks from the same recorded event as the shared-experts aux
+    # stream. The quant runs concurrently with the shared-expert burst on
+    # its own stream (the burst itself is untouched, unlike the head
+    # placement that regressed at BS1), and the main-stream consumer waits
+    # on a quant-completion event. Only takes effect when
+    # VLLM_SHARED_STREAM_QUANT_OFFLOAD is also enabled; the >= MIN_TOKENS
+    # aux-head placement is byte-identical with this flag on or off.
+    # Shape-based branch per captured CUDA graph size — graph-safe.
+    "VLLM_SHARED_STREAM_QUANT_OFFLOAD_BS1_DEDICATED": lambda: bool(
+        int(os.getenv("VLLM_SHARED_STREAM_QUANT_OFFLOAD_BS1_DEDICATED", "0"))
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer

@@ -509,10 +509,36 @@ class TrtLlmNvFp4ExpertsMonolithic(
 
         output1_scale_gate_scalar = self.quant_config.g1_alphas
 
+        # OP-301: when the moe_forward_shared_no_finalize capture window is
+        # active (VLLM_MOE_FINALIZE_AR_RMS_FUSION graph rewrite), skip the
+        # in-kernel finalize and return the unfinalized GEMM2 output. The
+        # routing tensors are stashed on the capture side-channel; the fused
+        # MNNVL finalize+AR+RMSNorm kernel consumes them downstream.
+        from vllm.model_executor.layers.fused_moe.moe_finalize_ar_rms import (
+            capture_active,
+            stash_unfinalized,
+        )
+
+        no_finalize = capture_active()
+        if no_finalize:
+            # With do_finalize=False the routing weights come back raw; the
+            # fused kernel applies routed_scaling_factor exactly once (from
+            # the graph constant `fused *= rsf`), so the MoE op must not also
+            # apply it. In production, apply_routed_scale_to_output=True
+            # routes the real RSF to the runner (visible in the FX graph) and
+            # neutralizes the kernel-side value to 1.0 (fused_moe/layer.py),
+            # so accept None or the identity 1.0 and normalize to None.
+            assert routed_scaling_factor is None or routed_scaling_factor == 1.0, (
+                "no-finalize capture requires routed_scaling_factor to be "
+                "applied outside the MoE kernel "
+                f"(got {routed_scaling_factor})"
+            )
+            routed_scaling_factor = None
+
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
@@ -540,8 +566,41 @@ class TrtLlmNvFp4ExpertsMonolithic(
             local_num_experts=self.local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=self.routing_method_type,
-            do_finalize=True,
+            do_finalize=not no_finalize,
             activation_type=activation_to_flashinfer_int(activation),
             per_token_scale=per_token_scale,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
-        )[0]
+        )
+
+        if no_finalize:
+            # do_finalize=False return contract (flashinfer/fused_moe/core.py,
+            # _unpack_trtllm_moe_output):
+            #   [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
+            gemm2_output, expert_weights, expanded_idx = result
+
+            if (
+                expert_weights.dtype == torch.float32
+                and self.routing_method_type == RoutingMethodType.DeepSeekV3
+            ):
+                # FlashInfer dtype-label bug: the DeepSeekV3 routing kernel
+                # ALWAYS writes bf16 expert weights
+                # (csrc/trtllm_fused_moe_runner.cu: "the expW is currently
+                # always bfloat16"), but the launcher labels the returned
+                # dlpack tensor fp32 whenever routing_logits are fp32
+                # (csrc/trtllm_fused_moe_kernel_launcher.cu:
+                # expert_weights_dtype = mRoutingLogitsDtype == Fp32 ? ...).
+                # The kernel wrote [num_tokens, top_k] bf16 row-major from the
+                # buffer base; reinterpret accordingly. The in-kernel finalize
+                # (do_finalize=True) reads bf16 via mDtypeExpW and is
+                # unaffected, which is why the baseline path works.
+                nt, tk = expert_weights.shape
+                expert_weights = (
+                    expert_weights.view(torch.bfloat16)
+                    .flatten()[: nt * tk]
+                    .view(nt, tk)
+                )
+
+            stash_unfinalized(expert_weights, expanded_idx)
+            return gemm2_output
+
+        return result[0]

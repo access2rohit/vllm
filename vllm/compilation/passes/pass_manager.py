@@ -158,6 +158,18 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:
+                    # OP-301: must run BEFORE AllReduceFusionPass. It consumes
+                    # the moe_forward_shared -> mul -> add -> all_reduce ->
+                    # fused_add_rms_norm region; if AllReduceFusionPass ran
+                    # first it would swallow the AR+RMSNorm tail. Gated by
+                    # VLLM_MOE_FINALIZE_AR_RMS_FUSION (default off) and
+                    # is_applicable_for_range (oneshot regime only).
+                    if envs.VLLM_MOE_FINALIZE_AR_RMS_FUSION:
+                        from .fusion.moe_finalize_ar_rms_fusion import (
+                            MoeFinalizeARRMSFusionPass,
+                        )
+
+                        self.passes += [MoeFinalizeARRMSFusionPass(config)]
                     self.passes += [AllReduceFusionPass(config)]
 
             if self.pass_config.fuse_norm_quant:

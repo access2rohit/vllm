@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEQuantConfig,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -20,6 +21,68 @@ from vllm.v1.worker.ubatching import (
 )
 
 logger = init_logger(__name__)
+
+# Stash for the routed-activation quant issued on the shared-experts aux
+# stream (VLLM_SHARED_STREAM_QUANT_OFFLOAD). Indexed by DBO ubatch id,
+# mirroring SharedExperts._output; slot 0 is used when DBO is disabled.
+# Each entry is (quant_input_ref, a1q, a1q_scale, ready_event) and is
+# single-shot: it is populated by maybe_sync_shared_experts_stream and
+# consumed (or discarded) by the next _quantize_input call on this thread.
+_AUX_STREAM_QUANT_STASH: list[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.cuda.Event] | None
+] = [None, None]
+
+# Dedicated stream for the below-MIN_TOKENS routed-activation quant offload
+# (VLLM_SHARED_STREAM_QUANT_OFFLOAD_BS1_DEDICATED). Module-level singleton
+# mirroring vllm.utils.torch_utils.aux_stream(): a single process-wide
+# stream avoids a per-layer stream explosion and keeps profiling sane.
+_quant_offload_stream: torch.cuda.Stream | None = None
+
+
+def quant_offload_stream() -> torch.cuda.Stream | None:
+    """Ensures the dedicated quant-offload stream is initialized only once."""
+    global _quant_offload_stream
+
+    if _quant_offload_stream is None and current_platform.is_cuda_alike():
+        _quant_offload_stream = torch.cuda.Stream()
+
+    return _quant_offload_stream
+
+
+def consume_aux_stream_quant_stash(
+    a1: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Return the aux-stream-quantized (a1q, a1q_scale) for `a1` if a stash
+    entry exists and was produced from exactly this tensor, else None.
+
+    The identity check (`is`, not equality) guarantees we only ever skip the
+    main-stream quant when the aux stream quantized the very same tensor
+    object; any intervening transform (router-weight scaling, dispatch,
+    padding) produces a new tensor and falls through to the baseline path.
+    """
+    idx = dbo_current_ubatch_id()
+    entry = _AUX_STREAM_QUANT_STASH[idx]
+    if entry is None:
+        return None
+    # Single-shot: always clear, even on identity mismatch, so a stale
+    # entry can never leak into a later layer / step.
+    _AUX_STREAM_QUANT_STASH[idx] = None
+    input_ref, a1q, a1q_scale, event = entry
+    if input_ref is not a1:
+        return None
+    logger.info_once(
+        "VLLM_SHARED_STREAM_QUANT_OFFLOAD: aux-stream quant stash adopted by "
+        "_quantize_input (main-stream quant skipped)"
+    )
+    stream = current_stream()
+    stream.wait_event(event)
+    # a1q/a1q_scale were allocated on the aux stream; mark their use on the
+    # consuming (main) stream so the caching allocator cannot reuse their
+    # blocks early.
+    a1q.record_stream(stream)
+    if a1q_scale is not None:
+        a1q_scale.record_stream(stream)
+    return a1q, a1q_scale
 
 
 class SharedExpertsOrder(IntEnum):
@@ -111,6 +174,7 @@ class SharedExperts(torch.nn.Module):
     def maybe_sync_shared_experts_stream(
         self,
         shared_experts_input: torch.Tensor,
+        offload_quant_config: FusedMoEQuantConfig | None = None,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -124,9 +188,112 @@ class SharedExperts(torch.nn.Module):
             # because we synch the streams before using shared_output.
             shared_experts_input.record_stream(self._stream)
 
-            # Mark sync start point for the aux stream since we will
-            # run in parallel with router/gate.
-            self._stream.wait_stream(current_stream())
+            # Three-way placement dispatch for the routed-activation quant.
+            # Per-BS gate: below MIN_TOKENS the quant at the head of the aux
+            # burst delays the shared-expert MLP enough that the aux stream
+            # starts gating the fork/join (measured E2E regression at BS1 on
+            # B200 TP8); at/above it the aux slack fully hides the quant.
+            # Shape-based branches like the token threshold in
+            # _determine_shared_experts_order: num_tokens is fixed per
+            # captured CUDA graph, so this is capture-safe.
+            offload_at_aux_head = (
+                offload_quant_config is not None
+                and shared_experts_input.shape[0]
+                >= envs.VLLM_SHARED_STREAM_QUANT_OFFLOAD_MIN_TOKENS
+            )
+            quant_stream = (
+                quant_offload_stream()
+                if (
+                    offload_quant_config is not None
+                    and not offload_at_aux_head
+                    and envs.VLLM_SHARED_STREAM_QUANT_OFFLOAD_BS1_DEDICATED
+                )
+                else None
+            )
+
+            if quant_stream is not None:
+                # Below MIN_TOKENS with the BS1 flag on: fork BOTH side
+                # streams from one event recorded on main and run the quant
+                # concurrently on the dedicated stream. The aux burst is not
+                # touched (unlike the head placement, which delayed it and
+                # regressed BS1); the consumer adopts the result through the
+                # stash's completion event exactly as in the head placement.
+                logger.info_once(
+                    "VLLM_SHARED_STREAM_QUANT_OFFLOAD_BS1_DEDICATED: "
+                    "routed-activation quant placed on the DEDICATED side "
+                    "stream for num_tokens=%d (< MIN_TOKENS=%d); aux burst "
+                    "untouched",
+                    shared_experts_input.shape[0],
+                    envs.VLLM_SHARED_STREAM_QUANT_OFFLOAD_MIN_TOKENS,
+                )
+                fork_event = torch.cuda.Event()
+                fork_event.record(current_stream())
+                self._stream.wait_event(fork_event)
+                quant_stream.wait_event(fork_event)
+                shared_experts_input.record_stream(quant_stream)
+                self._enqueue_aux_stream_quant(
+                    shared_experts_input, offload_quant_config, stream=quant_stream
+                )
+            else:
+                # Shipped fork, byte-identical for num_tokens >= MIN_TOKENS
+                # (and whenever the BS1 dedicated-stream flag is off).
+                # Mark sync start point for the aux stream since we will
+                # run in parallel with router/gate.
+                self._stream.wait_stream(current_stream())
+
+                if offload_at_aux_head:
+                    self._enqueue_aux_stream_quant(
+                        shared_experts_input, offload_quant_config
+                    )
+
+    def _enqueue_aux_stream_quant(
+        self,
+        x: torch.Tensor,
+        quant_config: FusedMoEQuantConfig,
+        stream: torch.cuda.Stream | None = None,
+    ):
+        """Issue the routed-activation quant on a side stream
+        (VLLM_SHARED_STREAM_QUANT_OFFLOAD).
+
+        By default (`stream=None`) the quant runs at the head of the
+        aux-stream burst, in the aux stream's slack ahead of the
+        shared-expert MLP. With an explicit `stream` (the dedicated
+        quant-offload stream, below MIN_TOKENS) it runs there instead,
+        concurrent with the untouched aux burst. Either way the stream has
+        already been synchronized with the main stream at the fork, so `x`
+        (the pre-routing hidden states) is ready, and a recorded event lets
+        the main-stream consumer (`_quantize_input` in the prepare step)
+        adopt the result instead of re-quantizing serially.
+        """
+        # Deferred import: utils pulls in quantization helper modules that
+        # must not become import-time deps of this (widely imported) module.
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input,
+        )
+
+        if stream is None:
+            stream = self._stream
+
+        input_sf = (
+            quant_config.a1_gscale
+            if quant_config.use_nvfp4_w4a4
+            else quant_config.a1_scale
+        )
+        with torch.cuda.stream(stream):
+            a1q, a1q_scale = moe_kernel_quantize_input(
+                x,
+                input_sf,
+                quant_dtype=quant_config.quant_dtype,
+                per_act_token_quant=quant_config.per_act_token_quant,
+                block_shape=quant_config.block_shape,
+                is_scale_swizzled=quant_config.is_scale_swizzled,
+                mx_alignment=quant_config.mx_alignment,
+            )
+            event = torch.cuda.Event()
+            event.record(stream)
+        # Index by ubatch id unconditionally (0 when DBO is inactive) so the
+        # producer and consumer (consume_aux_stream_quant_stash) always agree.
+        _AUX_STREAM_QUANT_STASH[dbo_current_ubatch_id()] = (x, a1q, a1q_scale, event)
 
     def _run_in_aux_stream(
         self,

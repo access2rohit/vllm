@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -610,6 +611,41 @@ class MoERunner(MoERunnerInterface):
             else nullcontext()
         )
 
+    def _aux_stream_offload_quant_config(self):
+        """Quant config to offload the routed-activation quant onto the
+        shared-experts aux stream, or None when offload doesn't apply.
+
+        Gated by VLLM_SHARED_STREAM_QUANT_OFFLOAD (default off). Only
+        no-DP/EP prepare/finalize paths know how to consume the stash
+        (see prepare_finalize/no_dp_ep.py), and kernels that defer input
+        quantization never quantize in prepare, so restrict to that case.
+        All gates here are config/type checks — never tensor values.
+        """
+        if not envs.VLLM_SHARED_STREAM_QUANT_OFFLOAD:
+            return None
+        moe_kernel = self._quant_method.moe_kernel
+        if moe_kernel is None or moe_kernel.fused_experts.expects_unquantized_inputs:
+            return None
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+            MoEPrepareAndFinalizeNoDPEPModular,
+            MoEPrepareAndFinalizeNoDPEPMonolithic,
+        )
+
+        if not isinstance(
+            moe_kernel.prepare_finalize,
+            (MoEPrepareAndFinalizeNoDPEPModular, MoEPrepareAndFinalizeNoDPEPMonolithic),
+        ):
+            return None
+        quant_config = moe_kernel.fused_experts.quant_config
+        if quant_config is None or quant_config.quant_dtype is None:
+            return None
+        logger.info_once(
+            "VLLM_SHARED_STREAM_QUANT_OFFLOAD: offloading routed-activation "
+            "quant (quant_dtype=%s) onto the shared-experts aux stream",
+            str(quant_config.quant_dtype),
+        )
+        return quant_config
+
     def _maybe_sync_shared_experts_stream(
         self,
         shared_experts_input: torch.Tensor | None,
@@ -620,7 +656,10 @@ class MoERunner(MoERunnerInterface):
         #        separate cuda stream)
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
+            self._shared_experts.maybe_sync_shared_experts_stream(
+                shared_experts_input,
+                offload_quant_config=self._aux_stream_offload_quant_config(),
+            )
 
     def _maybe_add_zero_expert_output(
         self,
